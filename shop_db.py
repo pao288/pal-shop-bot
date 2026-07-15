@@ -39,6 +39,23 @@ CREATE TABLE IF NOT EXISTS shop.shops (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE shop.shops ADD COLUMN IF NOT EXISTS shop_type TEXT;
+ALTER TABLE shop.shops ADD COLUMN IF NOT EXISTS owner_type TEXT;
+ALTER TABLE shop.shops ADD COLUMN IF NOT EXISTS is_official BOOLEAN;
+ALTER TABLE shop.shops ADD COLUMN IF NOT EXISTS forum_thread_id BIGINT;
+ALTER TABLE shop.shops ADD COLUMN IF NOT EXISTS panel_message_id BIGINT;
+ALTER TABLE shop.shops ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
+
+UPDATE shop.shops SET shop_type='PAL' WHERE shop_type IS NULL;
+UPDATE shop.shops SET owner_type='USER' WHERE owner_type IS NULL;
+UPDATE shop.shops SET is_official=FALSE WHERE is_official IS NULL;
+UPDATE shop.shops SET updated_at=NOW() WHERE updated_at IS NULL;
+
+ALTER TABLE shop.shops ALTER COLUMN shop_type SET DEFAULT 'PAL';
+ALTER TABLE shop.shops ALTER COLUMN owner_type SET DEFAULT 'USER';
+ALTER TABLE shop.shops ALTER COLUMN is_official SET DEFAULT FALSE;
+ALTER TABLE shop.shops ALTER COLUMN updated_at SET DEFAULT NOW();
+
 DROP INDEX IF EXISTS shop.uq_shop_user_owner;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_shop_user_owner_type
 ON shop.shops(guild_id, owner_id, shop_type)
@@ -74,6 +91,26 @@ CREATE TABLE IF NOT EXISTS shop.transactions (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE shop.products ADD COLUMN IF NOT EXISTS currency TEXT;
+ALTER TABLE shop.products ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
+UPDATE shop.products SET currency='PAL' WHERE currency IS NULL;
+UPDATE shop.products SET updated_at=NOW() WHERE updated_at IS NULL;
+ALTER TABLE shop.products ALTER COLUMN currency SET DEFAULT 'PAL';
+ALTER TABLE shop.products ALTER COLUMN updated_at SET DEFAULT NOW();
+
+ALTER TABLE shop.transactions ADD COLUMN IF NOT EXISTS currency TEXT;
+ALTER TABLE shop.transactions ADD COLUMN IF NOT EXISTS previous_status TEXT;
+ALTER TABLE shop.transactions ADD COLUMN IF NOT EXISTS ticket_channel_id BIGINT;
+ALTER TABLE shop.transactions ADD COLUMN IF NOT EXISTS shop_name_snapshot TEXT;
+ALTER TABLE shop.transactions ADD COLUMN IF NOT EXISTS product_name_snapshot TEXT;
+ALTER TABLE shop.transactions ADD COLUMN IF NOT EXISTS product_description_snapshot TEXT;
+ALTER TABLE shop.transactions ADD COLUMN IF NOT EXISTS price_snapshot BIGINT;
+ALTER TABLE shop.transactions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
+UPDATE shop.transactions SET currency='PAL' WHERE currency IS NULL;
+UPDATE shop.transactions SET updated_at=NOW() WHERE updated_at IS NULL;
+ALTER TABLE shop.transactions ALTER COLUMN currency SET DEFAULT 'PAL';
+ALTER TABLE shop.transactions ALTER COLUMN updated_at SET DEFAULT NOW();
 
 CREATE TABLE IF NOT EXISTS shop.escrows (
     transaction_id BIGINT PRIMARY KEY,
