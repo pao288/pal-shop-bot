@@ -1,6 +1,7 @@
 import discord
+import shop_service as svc
 
-def svc(i): return i.client.shop_service
+def money(n): return f"{int(n):,} PAL"
 
 class OpenShopModal(discord.ui.Modal, title="🏪 お店を開く"):
     shop_name = discord.ui.TextInput(label="店名", max_length=80)
@@ -9,143 +10,197 @@ class OpenShopModal(discord.ui.Modal, title="🏪 お店を開く"):
     product_description = discord.ui.TextInput(label="商品説明", style=discord.TextStyle.paragraph, max_length=1000)
     product_price = discord.ui.TextInput(label="商品価格 PAL", placeholder="50000", max_length=18)
 
+    def __init__(self, bot):
+        super().__init__()
+        self.bot = bot
+
     async def on_submit(self, i):
+        if await svc.get_user_shop(i.guild_id, i.user.id):
+            return await i.response.send_message("🏪 あなたはすでに店舗を持っています。", ephemeral=True)
         try:
-            price = int(self.product_price.value)
+            price = int(self.product_price.value.replace(",", "").strip())
             if price < 1: raise ValueError
         except ValueError:
-            return await i.response.send_message("商品価格は1 PAL以上の整数で入力してね。", ephemeral=True)
+            return await i.response.send_message("💰 商品価格は1 PAL以上の整数で入力してください。", ephemeral=True)
         await i.response.defer(ephemeral=True)
-        ok, result = await svc(i).create_shop(
-            i.guild, i.user, self.shop_name.value, self.shop_description.value,
-            self.product_name.value, self.product_description.value, price
-        )
-        text = "🏪 お店を開店しました！" if ok else f"作成結果: {result}"
-        await i.followup.send(text, ephemeral=True)
+        shop = await svc.create_shop(i.guild_id, i.user.id, self.shop_name.value, self.shop_description.value)
+        await svc.add_product(shop["shop_id"], self.product_name.value, self.product_description.value, price)
+        try:
+            await self.bot.publish_shop(i.guild, shop)
+        except Exception as e:
+            return await i.followup.send(f"店舗DBは作成済みです。フォーラム投稿でエラー: `{type(e).__name__}: {e}`", ephemeral=True)
+        await i.followup.send("🏪 開店しました！", ephemeral=True)
 
-class ShopPanelView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="🏪 お店を開く", style=discord.ButtonStyle.primary, custom_id="shop:open")
-    async def open_shop(self, i, b):
-        await i.response.send_modal(OpenShopModal())
-
-    @discord.ui.button(label="🛍️ お店を見る", style=discord.ButtonStyle.secondary, custom_id="shop:browse")
-    async def browse(self, i, b):
-        await i.response.send_message("指定フォーラムの店舗一覧からお店を選んでね。", ephemeral=True)
-
-class StoreView(discord.ui.View):
-    def __init__(self, shop_id):
-        super().__init__(timeout=None)
-        self.shop_id = int(shop_id)
-        self.children[0].custom_id = f"store:products:{self.shop_id}"
-        self.children[1].custom_id = f"store:info:{self.shop_id}"
-        self.children[2].custom_id = f"store:manage:{self.shop_id}"
-
-    @discord.ui.button(label="📦 商品一覧", style=discord.ButtonStyle.primary, custom_id="store:products")
-    async def products(self, i, b):
-        rows = await svc(i).products(self.shop_id)
-        if not rows:
-            return await i.response.send_message("現在販売中の商品はありません。", ephemeral=True)
-        await i.response.send_message(
-            embed=discord.Embed(title="📦 商品一覧", description="\n\n".join(
-                f"**#{r['product_id']} {r['name']}**\n{r['description']}\n💰 {r['price']:,} PAL" for r in rows[:10]
-            )),
-            view=ProductListView(rows[:10]), ephemeral=True
-        )
-
-    @discord.ui.button(label="ℹ️ 店舗情報", style=discord.ButtonStyle.secondary, custom_id="store:info")
-    async def info(self, i, b):
-        async with svc(i).pool.acquire() as con:
-            s = await con.fetchrow("SELECT * FROM shop.shops WHERE shop_id=$1", self.shop_id)
-        await i.response.send_message(f"🏪 {s['name']}\n\n{s['description']}\n\n👤 <@{s['owner_id']}>", ephemeral=True)
-
-    @discord.ui.button(label="⚙️ 店舗管理", style=discord.ButtonStyle.secondary, custom_id="store:manage")
-    async def manage(self, i, b):
-        async with svc(i).pool.acquire() as con:
-            s = await con.fetchrow("SELECT * FROM shop.shops WHERE shop_id=$1", self.shop_id)
-        if not s or s["owner_id"] != i.user.id:
-            return await i.response.send_message("店主専用です。", ephemeral=True)
-        await i.response.send_message("⚙️ 店舗管理", view=StoreManageView(self.shop_id), ephemeral=True)
-
-class ProductListView(discord.ui.View):
-    def __init__(self, rows):
-        super().__init__(timeout=300)
-        options=[discord.SelectOption(label=r["name"][:100], description=f"{r['price']:,} PAL", value=str(r["product_id"])) for r in rows]
-        select=discord.ui.Select(placeholder="購入する商品を選択", options=options)
-        select.callback=self.selected
-        self.add_item(select)
-
-    async def selected(self, i):
-        pid=int(i.data["values"][0])
-        await i.response.defer(ephemeral=True)
-        ok, result=await svc(i).start_purchase(i, pid)
-        await i.followup.send("🎫 取引チケットを作成しました！" if ok else f"購入結果: {result}", ephemeral=True)
-
-class AddProductModal(discord.ui.Modal, title="📦 商品追加"):
+class AddProductModal(discord.ui.Modal, title="📦 商品を追加"):
     name = discord.ui.TextInput(label="商品名", max_length=100)
     description = discord.ui.TextInput(label="商品説明", style=discord.TextStyle.paragraph, max_length=1000)
     price = discord.ui.TextInput(label="価格 PAL", placeholder="50000", max_length=18)
-    def __init__(self, shop_id):
-        super().__init__(); self.shop_id=shop_id
+
+    def __init__(self, bot, shop_id):
+        super().__init__()
+        self.bot, self.shop_id = bot, shop_id
+
     async def on_submit(self, i):
         try:
-            price=int(self.price.value)
+            price = int(self.price.value.replace(",", "").strip())
             if price < 1: raise ValueError
         except ValueError:
-            return await i.response.send_message("価格は1 PAL以上の整数で入力してね。", ephemeral=True)
-        await i.response.defer(ephemeral=True)
-        ok,res=await svc(i).add_product(i.guild,self.shop_id,i.user.id,self.name.value,self.description.value,price)
-        await i.followup.send("📦 商品を追加しました！" if ok else f"追加結果: {res}", ephemeral=True)
+            return await i.response.send_message("💰 価格は1 PAL以上の整数で入力してください。", ephemeral=True)
+        p = await svc.add_product(self.shop_id, self.name.value, self.description.value, price)
+        await i.response.send_message(f"📦 **{p['name']}** を追加しました。", ephemeral=True)
+        await self.bot.refresh_shop(self.shop_id)
+        await self.bot.announce_product(i.guild, self.shop_id, p)
 
-class StoreManageView(discord.ui.View):
-    def __init__(self, shop_id):
-        super().__init__(timeout=300); self.shop_id=shop_id
-    @discord.ui.button(label="➕ 商品追加", style=discord.ButtonStyle.success)
-    async def add(self,i,b): await i.response.send_modal(AddProductModal(self.shop_id))
-    @discord.ui.button(label="⏸️ 閉店 / 営業再開", style=discord.ButtonStyle.secondary)
-    async def toggle(self,i,b):
-        async with svc(i).pool.acquire() as con:
-            s=await con.fetchrow("SELECT * FROM shop.shops WHERE shop_id=$1",self.shop_id)
-            if not s or s["owner_id"]!=i.user.id:
-                return await i.response.send_message("店主専用です。",ephemeral=True)
-            new="paused" if s["status"]=="active" else "active"
-            await con.execute("UPDATE shop.shops SET status=$1,updated_at=NOW() WHERE shop_id=$2",new,self.shop_id)
-        await i.response.send_message("店舗状態を変更しました。",ephemeral=True)
-
-class TransactionView(discord.ui.View):
-    def __init__(self, txid):
-        super().__init__(timeout=None); self.txid=int(txid)
-        for n,c in enumerate(self.children): c.custom_id=f"tx:{n}:{self.txid}"
-    @discord.ui.button(label="📦 商品を渡しました", style=discord.ButtonStyle.primary, custom_id="tx:delivered")
-    async def delivered(self,i,b):
-        ok=await svc(i).seller_delivered(self.txid,i.user.id)
-        await i.response.send_message("購入者の受取確認待ちです。" if ok else "現在この操作は実行できません。",ephemeral=True)
-    @discord.ui.button(label="✅ 受け取りました", style=discord.ButtonStyle.success, custom_id="tx:received")
-    async def received(self,i,b):
-        await i.response.defer(ephemeral=True)
-        ok,res=await svc(i).buyer_received(self.txid,i.user.id)
-        await i.followup.send("✅ 取引完了！" if ok else f"処理結果: {res}",ephemeral=True)
-    @discord.ui.button(label="⚠️ 問題があります", style=discord.ButtonStyle.danger, custom_id="tx:problem")
-    async def problem(self,i,b):
-        ok=await svc(i).report_problem(self.txid,i.user.id)
-        await i.response.send_message("🚨 運営確認へ移行しました。" if ok else "現在この操作は実行できません。",ephemeral=True)
-
-class ShopAdminView(discord.ui.View):
-    def __init__(self):
+class ShopSetupView(discord.ui.View):
+    def __init__(self, bot):
         super().__init__(timeout=None)
-    async def interaction_check(self,i):
-        if not i.user.guild_permissions.administrator:
-            await i.response.send_message("管理者専用です。",ephemeral=True); return False
+        self.bot = bot
+
+    @discord.ui.button(label="お店を開く", emoji="🏪", style=discord.ButtonStyle.primary, custom_id="shop:open")
+    async def open_shop(self, i, b):
+        await i.response.send_modal(OpenShopModal(self.bot))
+
+    @discord.ui.button(label="自分のお店", emoji="📦", style=discord.ButtonStyle.secondary, custom_id="shop:mine")
+    async def mine(self, i, b):
+        shop = await svc.get_user_shop(i.guild_id, i.user.id)
+        if not shop:
+            return await i.response.send_message("🏪 まだ店舗を持っていません。", ephemeral=True)
+        await i.response.send_message(f"🏪 **{shop['name']}**\n状態: **{shop['status']}**", ephemeral=True)
+
+class ShopPanelView(discord.ui.View):
+    def __init__(self, bot, shop_id):
+        super().__init__(timeout=None)
+        self.bot, self.shop_id = bot, int(shop_id)
+        self.add_item(discord.ui.Button(label="商品一覧", emoji="📦", style=discord.ButtonStyle.primary,
+                                        custom_id=f"shop:products:{self.shop_id}"))
+        self.add_item(discord.ui.Button(label="店舗情報", emoji="ℹ️", style=discord.ButtonStyle.secondary,
+                                        custom_id=f"shop:info:{self.shop_id}"))
+        self.add_item(discord.ui.Button(label="店舗管理", emoji="⚙️", style=discord.ButtonStyle.secondary,
+                                        custom_id=f"shop:manage:{self.shop_id}"))
+
+    async def interaction_check(self, i):
+        cid = i.data.get("custom_id", "")
+        if cid.startswith("shop:products:"):
+            ps = await svc.products(self.shop_id)
+            if not ps: return await i.response.send_message("📦 商品はありません。", ephemeral=True) or False
+            options=[discord.SelectOption(label=p["name"][:100], description=f"{money(p['price'])} / {p['status']}", value=str(p["product_id"])) for p in ps[:25]]
+            return await i.response.send_message("📦 購入する商品を選択してください。", view=ProductSelectView(self.bot, options), ephemeral=True) or False
+        if cid.startswith("shop:info:"):
+            row = await svc.db.fetchrow("SELECT * FROM shop.shops WHERE shop_id=$1", self.shop_id)
+            return await i.response.send_message(f"🏪 **{row['name']}**\n\n{row['description']}\n\n状態: **{row['status']}**", ephemeral=True) or False
+        if cid.startswith("shop:manage:"):
+            row = await svc.db.fetchrow("SELECT * FROM shop.shops WHERE shop_id=$1", self.shop_id)
+            if i.user.id != row["owner_id"] and not i.user.guild_permissions.administrator:
+                return await i.response.send_message("⚙️ 店主用メニューです。", ephemeral=True) or False
+            return await i.response.send_message("⚙️ 店舗管理", view=ManageView(self.bot, self.shop_id), ephemeral=True) or False
         return True
-    @discord.ui.button(label="🏪 店舗管理", style=discord.ButtonStyle.primary, custom_id="admin:shops")
-    async def shops(self,i,b): await i.response.send_message("店舗管理DB接続済み。",ephemeral=True)
-    @discord.ui.button(label="📦 商品管理", style=discord.ButtonStyle.secondary, custom_id="admin:products")
-    async def products(self,i,b): await i.response.send_message("商品管理DB接続済み。",ephemeral=True)
-    @discord.ui.button(label="🎫 取引管理", style=discord.ButtonStyle.secondary, custom_id="admin:transactions")
-    async def txs(self,i,b): await i.response.send_message("取引管理DB接続済み。",ephemeral=True)
-    @discord.ui.button(label="🏛️ 公式ショップ管理", style=discord.ButtonStyle.secondary, custom_id="admin:official")
-    async def official(self,i,b): await i.response.send_message("公式ショップ管理DB接続済み。",ephemeral=True)
-    @discord.ui.button(label="📋 ログ確認", style=discord.ButtonStyle.secondary, custom_id="admin:logs")
-    async def logs(self,i,b): await i.response.send_message("SHOPログDB接続済み。",ephemeral=True)
+
+class ProductSelect(discord.ui.Select):
+    def __init__(self, bot, options):
+        super().__init__(placeholder="商品を選択", options=options)
+        self.bot = bot
+    async def callback(self, i):
+        p = await svc.get_product(int(self.values[0]))
+        if not p or p["status"] != "active" or p["shop_status"] != "active":
+            return await i.response.send_message("現在購入できません。", ephemeral=True)
+        e=discord.Embed(title=f"📦 {p['name']}", description=p["description"])
+        e.add_field(name="💰 価格", value=money(p["price"]))
+        await i.response.send_message(embed=e, view=BuyView(self.bot, p["product_id"]), ephemeral=True)
+
+class ProductSelectView(discord.ui.View):
+    def __init__(self, bot, options):
+        super().__init__(timeout=300)
+        self.add_item(ProductSelect(bot, options))
+
+class BuyView(discord.ui.View):
+    def __init__(self, bot, product_id):
+        super().__init__(timeout=300)
+        self.bot, self.product_id = bot, int(product_id)
+    @discord.ui.button(label="購入する", emoji="🛒", style=discord.ButtonStyle.success)
+    async def buy(self, i, b):
+        await i.response.defer(ephemeral=True)
+        p = await svc.get_product(self.product_id)
+        if not p or p["status"] != "active" or p["shop_status"] != "active":
+            return await i.followup.send("現在購入できません。", ephemeral=True)
+        if i.user.id == p["owner_id"]:
+            return await i.followup.send("自分の商品です。", ephemeral=True)
+        ok, msg = await self.bot.reserve_pal(i.guild_id, i.user.id, p["owner_id"], p["price"])
+        if not ok:
+            return await i.followup.send(msg, ephemeral=True)
+        tx = await svc.create_transaction(i.guild_id, p, i.user.id)
+        ch = await self.bot.create_ticket(i.guild, tx)
+        await svc.set_ticket(tx["transaction_id"], ch.id)
+        await i.followup.send(f"🎫 取引チケットを作成しました: {ch.mention}", ephemeral=True)
+
+class ManageView(discord.ui.View):
+    def __init__(self, bot, shop_id):
+        super().__init__(timeout=300)
+        self.bot, self.shop_id = bot, shop_id
+    @discord.ui.button(label="商品追加", emoji="➕", style=discord.ButtonStyle.primary)
+    async def add(self, i, b):
+        await i.response.send_modal(AddProductModal(self.bot, self.shop_id))
+    @discord.ui.button(label="閉店 / 営業再開", emoji="🔁", style=discord.ButtonStyle.secondary)
+    async def toggle(self, i, b):
+        row=await svc.db.fetchrow("SELECT status FROM shop.shops WHERE shop_id=$1", self.shop_id)
+        new="closed" if row["status"]=="active" else "active"
+        await svc.db.execute("UPDATE shop.shops SET status=$2,updated_at=NOW() WHERE shop_id=$1",self.shop_id,new)
+        await self.bot.refresh_shop(self.shop_id)
+        await i.response.send_message(f"状態を **{new}** に変更しました。", ephemeral=True)
+
+class TicketView(discord.ui.View):
+    def __init__(self, bot, transaction_id):
+        super().__init__(timeout=None)
+        self.bot, self.transaction_id = bot, int(transaction_id)
+
+    @discord.ui.button(label="商品を渡しました", emoji="📦", style=discord.ButtonStyle.primary, custom_id="shop:ticket:delivered")
+    async def delivered(self, i, b):
+        tx=await svc.transaction(self.transaction_id)
+        if i.user.id != tx["seller_id"]: return await i.response.send_message("店主用です。", ephemeral=True)
+        if tx["status"]!="SELLER_ACTION_REQUIRED": return await i.response.send_message("現在この操作はできません。", ephemeral=True)
+        await svc.set_transaction_status(self.transaction_id,"BUYER_CONFIRMATION_REQUIRED")
+        await i.response.send_message("📦 商品を渡した状態にしました。購入者は受取確認してください。")
+        await self.bot.refresh_ticket(i.channel, self.transaction_id)
+
+    @discord.ui.button(label="受け取りました", emoji="✅", style=discord.ButtonStyle.success, custom_id="shop:ticket:received")
+    async def received(self, i, b):
+        tx=await svc.transaction(self.transaction_id)
+        if i.user.id != tx["buyer_id"]: return await i.response.send_message("購入者用です。", ephemeral=True)
+        if tx["status"]!="BUYER_CONFIRMATION_REQUIRED": return await i.response.send_message("店主の受け渡し待ちです。", ephemeral=True)
+        ok,msg=await self.bot.release_pal(tx)
+        if not ok: return await i.response.send_message(msg, ephemeral=True)
+        await svc.set_transaction_status(self.transaction_id,"COMPLETED")
+        await i.response.send_message("✅ 取引完了！")
+        await self.bot.finish_ticket(i.channel, self.transaction_id)
+
+    @discord.ui.button(label="問題があります", emoji="⚠️", style=discord.ButtonStyle.danger, custom_id="shop:ticket:problem")
+    async def problem(self, i, b):
+        tx=await svc.transaction(self.transaction_id)
+        if i.user.id not in (tx["buyer_id"],tx["seller_id"]): return await i.response.send_message("取引参加者用です。", ephemeral=True)
+        await svc.set_transaction_status(self.transaction_id,"STAFF_REVIEW",tx["status"])
+        await i.response.send_message("🚨 STAFF REVIEWへ移行しました。")
+        await self.bot.refresh_ticket(i.channel,self.transaction_id)
+
+    @discord.ui.button(label="取引キャンセル", emoji="❌", style=discord.ButtonStyle.secondary, custom_id="shop:ticket:cancel")
+    async def cancel(self, i, b):
+        tx=await svc.transaction(self.transaction_id)
+        if i.user.id not in (tx["buyer_id"],tx["seller_id"]): return await i.response.send_message("取引参加者用です。", ephemeral=True)
+        await svc.set_transaction_status(self.transaction_id,"CANCEL_PENDING",tx["status"])
+        await i.response.send_message("❌ キャンセル申請。相手は下から選択してください。",view=CancelDecisionView(self.bot,self.transaction_id))
+
+class CancelDecisionView(discord.ui.View):
+    def __init__(self,bot,transaction_id):
+        super().__init__(timeout=None); self.bot=bot; self.transaction_id=transaction_id
+    @discord.ui.button(label="キャンセルに同意",style=discord.ButtonStyle.danger)
+    async def agree(self,i,b):
+        tx=await svc.transaction(self.transaction_id)
+        ok,msg=await self.bot.refund_pal(tx)
+        if not ok:return await i.response.send_message(msg,ephemeral=True)
+        await svc.set_transaction_status(self.transaction_id,"REFUNDED")
+        await i.response.send_message("↩️ 全額返金し、取引を終了しました。")
+        await self.bot.finish_ticket(i.channel,self.transaction_id)
+    @discord.ui.button(label="取引を続ける",style=discord.ButtonStyle.primary)
+    async def continue_(self,i,b):
+        tx=await svc.transaction(self.transaction_id)
+        await svc.set_transaction_status(self.transaction_id,tx["previous_status"] or "SELLER_ACTION_REQUIRED")
+        await i.response.send_message("🔁 取引を継続します。")
+        await self.bot.refresh_ticket(i.channel,self.transaction_id)
