@@ -245,9 +245,14 @@ async def delete_system(guild):
                         await change_balance(con, acct["account_id"], e["amount"])
                         await con.execute("""UPDATE shop.escrows SET status='REFUNDED',refunded_at=NOW()
                                              WHERE transaction_id=$1""", tx["transaction_id"])
+            # FK順序を固定: transactions -> orphan escrows -> products -> shops -> system
+            # 古いDBの products_shop_id_fkey が ON DELETE CASCADE なしでも削除できる。
             await con.execute("DELETE FROM shop.transactions WHERE guild_id=$1", guild.id)
             await con.execute("""DELETE FROM shop.escrows e WHERE NOT EXISTS(
                 SELECT 1 FROM shop.transactions t WHERE t.transaction_id=e.transaction_id)""")
+            await con.execute("""DELETE FROM shop.products p
+                                 USING shop.shops s
+                                 WHERE p.shop_id=s.shop_id AND s.guild_id=$1""", guild.id)
             await con.execute("DELETE FROM shop.shops WHERE guild_id=$1", guild.id)
             await con.execute("DELETE FROM shop.systems WHERE guild_id=$1", guild.id)
 

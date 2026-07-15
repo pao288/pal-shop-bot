@@ -99,6 +99,22 @@ UPDATE shop.products SET updated_at=NOW() WHERE updated_at IS NULL;
 ALTER TABLE shop.products ALTER COLUMN currency SET DEFAULT 'PAL';
 ALTER TABLE shop.products ALTER COLUMN updated_at SET DEFAULT NOW();
 
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'products_shop_id_fkey'
+          AND conrelid = 'shop.products'::regclass
+    ) THEN
+        ALTER TABLE shop.products DROP CONSTRAINT products_shop_id_fkey;
+    END IF;
+END $$;
+
+ALTER TABLE shop.products
+ADD CONSTRAINT products_shop_id_fkey
+FOREIGN KEY (shop_id) REFERENCES shop.shops(shop_id) ON DELETE CASCADE;
+
 ALTER TABLE shop.transactions ADD COLUMN IF NOT EXISTS currency TEXT;
 ALTER TABLE shop.transactions ADD COLUMN IF NOT EXISTS previous_status TEXT;
 ALTER TABLE shop.transactions ADD COLUMN IF NOT EXISTS ticket_channel_id BIGINT;
