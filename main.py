@@ -44,12 +44,79 @@ async def setup_hook():
 async def on_ready():
     log.info("PAL SHOP起動完了: %s",bot.user)
 
+async def save_config(guild_id, key, value):
+    await db.execute("""INSERT INTO shop.bot_settings(guild_id,key,value) VALUES($1,$2,$3)
+                        ON CONFLICT(guild_id,key) DO UPDATE SET value=EXCLUDED.value""",
+                     guild_id, key, str(value))
+
+async def ensure_shop_channels(guild):
+    me = guild.me
+    if me is None:
+        raise RuntimeError("BOTメンバー情報を取得できません")
+
+    category = discord.utils.get(guild.categories, name="🏪 PAL SHOP")
+    if category is None:
+        category = await guild.create_category("🏪 PAL SHOP", reason="PAL SHOP 自動セットアップ")
+
+    forum = discord.utils.get(guild.forums, name="🏪｜ショップ")
+    if forum is None:
+        forum = await guild.create_forum(
+            "🏪｜ショップ",
+            category=category,
+            reason="PAL SHOP 自動セットアップ"
+        )
+
+    announce = discord.utils.get(guild.text_channels, name="📢｜商品追加")
+    if announce is None:
+        announce = await guild.create_text_channel(
+            "📢｜商品追加",
+            category=category,
+            reason="PAL SHOP 自動セットアップ"
+        )
+
+    ticket_category = discord.utils.get(guild.categories, name="🎫 PAL SHOP 取引")
+    if ticket_category is None:
+        ticket_category = await guild.create_category(
+            "🎫 PAL SHOP 取引",
+            overwrites={
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                me: discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    manage_channels=True
+                )
+            },
+            reason="PAL SHOP 自動セットアップ"
+        )
+
+    await save_config(guild.id, "SHOP_FORUM_CHANNEL_ID", forum.id)
+    await save_config(guild.id, "SHOP_TICKET_CATEGORY_ID", ticket_category.id)
+    await save_config(guild.id, "SHOP_ANNOUNCE_CHANNEL_ID", announce.id)
+
+    return category, forum, announce, ticket_category
+
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def shopsetup(ctx):
-    e=discord.Embed(title="🏪 PAL SHOP",description="PALサーバーのマーケット。\n\n自分のお店を開き、商品をPALで販売できます。")
+    try:
+        category, forum, announce, ticket_category = await ensure_shop_channels(ctx.guild)
+    except discord.Forbidden:
+        return await ctx.send("❌ PAL SHOPに「チャンネルの管理」権限を付けてから、もう一度 `!shopsetup` を実行してください。")
+    except Exception as e:
+        return await ctx.send(f"❌ SHOPセットアップエラー: `{type(e).__name__}: {e}`")
+
+    e=discord.Embed(
+        title="🏪 PAL SHOP",
+        description="PALサーバーのマーケット。\n\n自分のお店を開き、商品をPALで販売できます。"
+    )
     e.add_field(name="🏪 お店を開く",value="店名・説明・最初の商品を登録",inline=False)
     e.add_field(name="📦 自分のお店",value="店舗状態を確認",inline=False)
+    e.add_field(
+        name="✅ SHOP SYSTEM",
+        value=f"店舗: {forum.mention}\n商品追加: {announce.mention}\n取引チケット: **{ticket_category.name}**",
+        inline=False
+    )
     await ctx.send(embed=e,view=ShopSetupView(bot))
 
 @bot.command()
