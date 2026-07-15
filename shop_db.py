@@ -187,6 +187,16 @@ async def fetch(q, *args):
     async with POOL.acquire() as con:
         return await con.fetch(q, *args)
 
+async def fetchval(q, *args):
+    async with POOL.acquire() as con:
+        return await con.fetchval(q, *args)
+
 async def execute(q, *args):
     async with POOL.acquire() as con:
         return await con.execute(q, *args)
+
+
+def acquire():
+    if POOL is None:
+        raise RuntimeError("SHOP_DB_POOL_NOT_INITIALIZED")
+    return POOL.acquire()
