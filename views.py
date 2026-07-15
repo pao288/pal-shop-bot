@@ -65,7 +65,40 @@ class ShopSetupView(discord.ui.View):
         shop = await svc.get_user_shop(i.guild_id, i.user.id)
         if not shop:
             return await i.response.send_message("🏪 まだ店舗を持っていません。", ephemeral=True)
-        await i.response.send_message(f"🏪 **{shop['name']}**\n状態: **{shop['status']}**", ephemeral=True)
+
+        if not shop["forum_thread_id"] or not shop["panel_message_id"]:
+            await i.response.defer(ephemeral=True)
+            try:
+                await self.bot.publish_shop(i.guild, shop)
+            except Exception as e:
+                return await i.followup.send(
+                    f"❌ フォーラム投稿エラー: `{type(e).__name__}: {e}`",
+                    ephemeral=True
+                )
+            return await i.followup.send(
+                f"🏪 **{shop['name']}** をショップフォーラムへ公開しました！",
+                ephemeral=True
+            )
+
+        thread = i.guild.get_channel(shop["forum_thread_id"])
+        if thread:
+            return await i.response.send_message(
+                f"🏪 **{shop['name']}**\n状態: **{shop['status']}**\n\n{thread.mention}",
+                ephemeral=True
+            )
+
+        await i.response.defer(ephemeral=True)
+        try:
+            await self.bot.publish_shop(i.guild, shop)
+        except Exception as e:
+            return await i.followup.send(
+                f"❌ フォーラム再投稿エラー: `{type(e).__name__}: {e}`",
+                ephemeral=True
+            )
+        await i.followup.send(
+            f"🏪 **{shop['name']}** をショップフォーラムへ再公開しました！",
+            ephemeral=True
+        )
 
 class ShopPanelView(discord.ui.View):
     def __init__(self, bot, shop_id):
