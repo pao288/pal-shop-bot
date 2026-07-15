@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 from zoneinfo import ZoneInfo
+from datetime import datetime, timezone, timedelta
 import discord
 from discord.ext import commands
 import shop_db as db
@@ -112,8 +113,7 @@ def pal_open_embed():
         title="🏪 PAL SHOP",
         description=(
             "PALで商品を販売できるユーザーマーケットです。\n\n"
-            "🏪 お店を開く\n店名・説明・最初の商品を登録します。\n\n"
-            "📦 自分のお店\n自分の店舗を確認・管理します。"
+            "🏪 お店を開く\n店名・説明・最初の商品を登録します。"
         )
     )
 
@@ -341,7 +341,7 @@ async def recover_pal_shops(guild):
                             AND status<>'DELETED' ORDER BY shop_id""",guild.id)
     for shop in shops:
         try: await restore_shop_thread(guild,shop)
-        except Exception: logger.exception("PAL店舗復旧失敗 shop_id=%s",shop["shop_id"])
+        except Exception: log.exception("PAL店舗復旧失敗 shop_id=%s",shop["shop_id"])
 
 class OpenShopModal(discord.ui.Modal, title="🏪 お店を開く"):
     shop_name = discord.ui.TextInput(label="店名", max_length=80)
@@ -371,17 +371,25 @@ class OpenShopModal(discord.ui.Modal, title="🏪 お店を開く"):
         await db.execute("""INSERT INTO shop.products(shop_id,name,description,price,currency)
                             VALUES($1,$2,$3,$4,'PAL')""",
                          shop["shop_id"],self.product_name.value,self.product_description.value,price)
-        forum = i.guild.get_channel(system["pal_forum_channel_id"])
-        count = 1
-        created = await forum.create_thread(
-            name=f"🏪 {shop['name']}",
-            embed=await store_embed(shop,0),
-            view=StoreView(shop["shop_id"],0,max(1,(count+9)//10))
-        )
-        thread = created.thread
-        msg = created.message
-        await db.execute("""UPDATE shop.shops SET forum_thread_id=$2,panel_message_id=$3,updated_at=NOW()
-                            WHERE shop_id=$1""", shop["shop_id"],thread.id,msg.id)
+        try:
+            forum = await ensure_pal_forum(i.guild)
+            if not forum:
+                raise RuntimeError("PAL_FORUM_NOT_FOUND")
+            count = 1
+            created = await forum.create_thread(
+                name=f"🏪 {shop['name']}"[:100],
+                embed=await store_embed(shop,0),
+                view=StoreView(shop["shop_id"],0,max(1,(count+9)//10))
+            )
+            thread = created.thread
+            msg = created.message
+            await db.execute("""UPDATE shop.shops SET forum_thread_id=$2,panel_message_id=$3,updated_at=NOW()
+                                WHERE shop_id=$1""", shop["shop_id"],thread.id,msg.id)
+        except Exception:
+            log.exception("店舗新規作成失敗 shop_id=%s",shop["shop_id"])
+            await db.execute("DELETE FROM shop.products WHERE shop_id=$1",shop["shop_id"])
+            await db.execute("DELETE FROM shop.shops WHERE shop_id=$1",shop["shop_id"])
+            return await i.followup.send("店舗作成処理を完了できませんでした。ログを確認してください。",ephemeral=True)
         await i.followup.send(f"🏪 **{shop['name']}** を開店しました！", ephemeral=True)
 
 class OpenShopPanel(discord.ui.View):
@@ -392,12 +400,29 @@ class OpenShopPanel(discord.ui.View):
         shop=await db.fetchrow("""SELECT * FROM shop.shops WHERE guild_id=$1 AND owner_id=$2
                                   AND shop_type='PAL' AND status<>'DELETED'
                                   ORDER BY shop_id DESC LIMIT 1""",i.guild_id,i.user.id)
-        if not shop: return await i.response.send_modal(OpenShopModal())
-        thread=await restore_shop_thread(i.guild,shop)
-        if not thread: return await i.response.send_message("店舗を復旧できませんでした。もう一度押してください。",ephemeral=True)
+        if not shop:
+            return await i.response.send_modal(OpenShopModal())
+
+        await i.response.defer(ephemeral=True)
+        try:
+            thread=await restore_shop_thread(i.guild,shop)
+        except Exception:
+            log.exception("店舗スレッド復旧失敗 shop_id=%s",shop["shop_id"])
+            return await i.followup.send("店舗の復旧処理でエラーが出ました。ログを確認してください。",ephemeral=True)
+
+        if not thread:
+            return await i.followup.send("店舗を復旧できませんでした。もう一度押してください。",ephemeral=True)
+
         v=discord.ui.View(timeout=300)
         v.add_item(discord.ui.Button(label="お店を見る",emoji="🏪",url=thread.jump_url))
-        await i.response.send_message(embed=discord.Embed(title="♻️ お店を復旧しました",description=f"🏪 **{shop['name']}**\n\n店舗スレッドを確認できます。"),view=v,ephemeral=True)
+        await i.followup.send(
+            embed=discord.Embed(
+                title="🏪 自分のお店",
+                description=f"**{shop['name']}**\n\n店舗スレッドを開けます。"
+            ),
+            view=v,
+            ephemeral=True
+        )
 
 class AddProductModal(discord.ui.Modal):
     name = discord.ui.TextInput(label="商品名", max_length=100)
@@ -415,6 +440,7 @@ class AddProductModal(discord.ui.Modal):
             if price < 1: raise ValueError
         except ValueError:
             return await i.response.send_message("価格は1以上の整数で入力してください。", ephemeral=True)
+        await i.response.defer(ephemeral=True)
         p = await db.fetchrow("""INSERT INTO shop.products(shop_id,name,description,price,currency)
                                  VALUES($1,$2,$3,$4,$5) RETURNING *""",
                               self.shop_id,self.name.value,self.description.value,price,self.currency)
@@ -441,7 +467,7 @@ class AddProductModal(discord.ui.Modal):
         await refresh_store(i.guild, self.shop_id)
         if self.currency == "CHIP":
             await refresh_casino_panel(i.guild)
-        await i.response.send_message(
+        await i.followup.send(
             f"📦 **{p['name']}** を追加しました。\n💰 {fmt_money(p['price'], p['currency'])}",
             ephemeral=True
         )
@@ -800,20 +826,22 @@ class TicketView(discord.ui.View):
         tx=await db.fetchrow("SELECT * FROM shop.transactions WHERE transaction_id=$1",self.txid)
         if i.user.id!=tx["seller_id"]:return await i.response.send_message("店主用です。",ephemeral=True)
         if tx["status"]!="SELLER_ACTION_REQUIRED":return await i.response.send_message("現在この操作はできません。",ephemeral=True)
+        await i.response.defer()
         await db.execute("UPDATE shop.transactions SET status='BUYER_CONFIRMATION_REQUIRED',updated_at=NOW() WHERE transaction_id=$1",self.txid)
         await refresh_ticket(i.channel,self.txid)
-        await i.response.send_message("📦 購入者の受取確認待ちです。")
+        await i.followup.send("📦 購入者の受取確認待ちです。")
 
     @discord.ui.button(label="受け取りました",emoji="✅",style=discord.ButtonStyle.success,custom_id="shop:tx:received")
     async def received(self,i,b):
         tx=await db.fetchrow("SELECT * FROM shop.transactions WHERE transaction_id=$1",self.txid)
         if i.user.id!=tx["buyer_id"]:return await i.response.send_message("購入者用です。",ephemeral=True)
         if tx["status"]!="BUYER_CONFIRMATION_REQUIRED":return await i.response.send_message("店主の対応待ちです。",ephemeral=True)
+        await i.response.defer()
         ok,msg=await release_funds(self.txid)
-        if not ok:return await i.response.send_message(f"処理結果: `{msg}`",ephemeral=True)
+        if not ok:return await i.followup.send(f"処理結果: `{msg}`",ephemeral=True)
         await db.execute("UPDATE shop.transactions SET status='COMPLETED',updated_at=NOW() WHERE transaction_id=$1",self.txid)
         await refresh_ticket(i.channel,self.txid)
-        await i.response.send_message("✅ 取引完了！10分後にチケットを削除します。")
+        await i.followup.send("✅ 取引完了！10分後にチケットを削除します。")
         await asyncio.sleep(600)
         try:await i.channel.delete(reason="SHOP取引完了")
         except discord.NotFound:pass
@@ -822,9 +850,10 @@ class TicketView(discord.ui.View):
     async def problem(self,i,b):
         tx=await db.fetchrow("SELECT * FROM shop.transactions WHERE transaction_id=$1",self.txid)
         if i.user.id not in (tx["buyer_id"],tx["seller_id"]):return await i.response.send_message("取引参加者用です。",ephemeral=True)
+        await i.response.defer()
         await db.execute("UPDATE shop.transactions SET previous_status=status,status='STAFF_REVIEW',updated_at=NOW() WHERE transaction_id=$1",self.txid)
         await refresh_ticket(i.channel,self.txid)
-        await i.response.send_message("🚨 STAFF REVIEWへ移行しました。")
+        await i.followup.send("🚨 STAFF REVIEWへ移行しました。")
 
     @discord.ui.button(label="取引キャンセル",emoji="❌",style=discord.ButtonStyle.secondary,custom_id="shop:tx:cancel")
     async def cancel(self,i,b):
@@ -842,11 +871,12 @@ class CancelView(discord.ui.View):
         tx=await db.fetchrow("SELECT * FROM shop.transactions WHERE transaction_id=$1",self.txid)
         if i.user.id==self.requester or i.user.id not in (tx["buyer_id"],tx["seller_id"]):
             return await i.response.send_message("相手側が押してください。",ephemeral=True)
+        await i.response.defer()
         ok,msg=await refund_funds(self.txid)
-        if not ok:return await i.response.send_message(f"処理結果: `{msg}`",ephemeral=True)
+        if not ok:return await i.followup.send(f"処理結果: `{msg}`",ephemeral=True)
         await db.execute("UPDATE shop.transactions SET status='REFUNDED',updated_at=NOW() WHERE transaction_id=$1",self.txid)
         await refresh_ticket(i.channel,self.txid)
-        await i.response.send_message("↩️ 全額返金しました。10分後にチケットを削除します。")
+        await i.followup.send("↩️ 全額返金しました。10分後にチケットを削除します。")
         await asyncio.sleep(600)
         try:await i.channel.delete(reason="SHOP返金完了")
         except discord.NotFound:pass
@@ -877,13 +907,17 @@ class EditProductModal(discord.ui.Modal,title="✏️ 商品情報を変更"):
         self.product_name.default=p["name"]; self.product_description.default=p["description"]; self.product_price.default=str(p["price"])
     async def on_submit(self,i):
         try:
-            price=int(self.product_price.value.replace(",","")); assert price>=1
-        except: return await i.response.send_message("価格は1以上の整数で入力してください。",ephemeral=True)
+            price=int(self.product_price.value.replace(",",""))
+            if price < 1:
+                raise ValueError
+        except ValueError:
+            return await i.response.send_message("価格は1以上の整数で入力してください。",ephemeral=True)
+        await i.response.defer(ephemeral=True)
         await db.execute("UPDATE shop.products SET name=$2,description=$3,price=$4,updated_at=NOW() WHERE product_id=$1",self.product_id,self.product_name.value,self.product_description.value,price)
         p=await db.fetchrow("SELECT * FROM shop.products WHERE product_id=$1",self.product_id)
         await refresh_store(i.guild,p["shop_id"]); s=await db.fetchrow("SELECT * FROM shop.shops WHERE shop_id=$1",p["shop_id"])
         if s and s["shop_type"]=="CASINO": await refresh_casino_panel(i.guild)
-        await i.response.send_message("✏️ 商品情報を更新しました。",ephemeral=True)
+        await i.followup.send("✏️ 商品情報を更新しました。",ephemeral=True)
 
 class ProductActionView(discord.ui.View):
     def __init__(self,product_id): super().__init__(timeout=300); self.product_id=int(product_id)
@@ -893,18 +927,25 @@ class ProductActionView(discord.ui.View):
         await i.response.send_modal(EditProductModal(p))
     @discord.ui.button(label="販売停止 / 再開",emoji="⏯️",style=discord.ButtonStyle.secondary)
     async def toggle(self,i,b):
-        p=await db.fetchrow("SELECT * FROM shop.products WHERE product_id=$1",self.product_id); new="PAUSED" if p["status"]=="ACTIVE" else "ACTIVE"
+        await i.response.defer(ephemeral=True)
+        p=await db.fetchrow("SELECT * FROM shop.products WHERE product_id=$1",self.product_id)
+        if not p:
+            return await i.followup.send("商品が見つかりません。",ephemeral=True)
+        new="PAUSED" if p["status"]=="ACTIVE" else "ACTIVE"
         await db.execute("UPDATE shop.products SET status=$2,updated_at=NOW() WHERE product_id=$1",self.product_id,new)
         await refresh_store(i.guild,p["shop_id"]); s=await db.fetchrow("SELECT * FROM shop.shops WHERE shop_id=$1",p["shop_id"])
         if s and s["shop_type"]=="CASINO": await refresh_casino_panel(i.guild)
-        await i.response.send_message(f"商品状態: **{new}**",ephemeral=True)
+        await i.followup.send(f"商品状態: **{new}**",ephemeral=True)
     @discord.ui.button(label="商品削除",emoji="🗑️",style=discord.ButtonStyle.danger)
     async def delete(self,i,b):
+        await i.response.defer(ephemeral=True)
         p=await db.fetchrow("SELECT * FROM shop.products WHERE product_id=$1",self.product_id)
+        if not p:
+            return await i.followup.send("商品が見つかりません。",ephemeral=True)
         await db.execute("UPDATE shop.products SET status='DELETED',updated_at=NOW() WHERE product_id=$1",self.product_id)
         await refresh_store(i.guild,p["shop_id"]); s=await db.fetchrow("SELECT * FROM shop.shops WHERE shop_id=$1",p["shop_id"])
         if s and s["shop_type"]=="CASINO": await refresh_casino_panel(i.guild)
-        await i.response.send_message("🗑️ 商品を削除しました。",ephemeral=True)
+        await i.followup.send("🗑️ 商品を削除しました。",ephemeral=True)
 
 
 async def show_product_admin(i,shop_id):
@@ -1036,21 +1077,22 @@ class AuctionBidModal(discord.ui.Modal,title="💰 入札"):
     async def on_submit(self,i):
         try:amount=int(self.amount.value.replace(",",""))
         except ValueError:return await i.response.send_message("整数PALで入力してください。",ephemeral=True)
+        await i.response.defer(ephemeral=True)
         async with db.acquire() as con:
             async with con.transaction():
                 a=await con.fetchrow("SELECT * FROM shop.auctions WHERE auction_id=$1 FOR UPDATE",self.aid)
-                if not a or a["status"]!="ACTIVE" or a["ends_at"]<=datetime.now(timezone.utc):return await i.response.send_message("競りは終了しています。",ephemeral=True)
-                if a["seller_id"]==i.user.id:return await i.response.send_message("自分の競りには入札できません。",ephemeral=True)
-                if amount<=a["current_price"]:return await i.response.send_message("現在価格より1 PAL以上高く入力してください。",ephemeral=True)
-                acc=await con.fetchrow("SELECT * FROM bank.accounts WHERE account_type='USER' AND owner_id=$1 AND currency='PAL' FOR UPDATE",i.user.id)
-                if not acc or acc["balance"]<amount:return await i.response.send_message("PAL残高が不足しています。",ephemeral=True)
+                if not a or a["status"]!="ACTIVE" or a["ends_at"]<=datetime.now(timezone.utc):return await i.followup.send("競りは終了しています。",ephemeral=True)
+                if a["seller_id"]==i.user.id:return await i.followup.send("自分の競りには入札できません。",ephemeral=True)
+                if amount<=a["current_price"]:return await i.followup.send("現在価格より1 PAL以上高く入力してください。",ephemeral=True)
+                acc=await account_row(con,i.user.id,"PAL",True)
+                if not acc or acc["balance"]<amount:return await i.followup.send("PAL残高が不足しています。",ephemeral=True)
                 old=None
-                if a["highest_bidder_id"]:old=await con.fetchrow("SELECT * FROM bank.accounts WHERE account_type='USER' AND owner_id=$1 AND currency='PAL' FOR UPDATE",a["highest_bidder_id"])
-                await con.execute("UPDATE bank.accounts SET balance=balance-$2,updated_at=NOW() WHERE account_id=$1",acc["account_id"],amount)
-                if old:await con.execute("UPDATE bank.accounts SET balance=balance+$2,updated_at=NOW() WHERE account_id=$1",old["account_id"],a["current_price"])
+                if a["highest_bidder_id"]:old=await account_row(con,a["highest_bidder_id"],"PAL",True)
+                await change_balance(con,acc["account_id"],-amount)
+                if old: await change_balance(con,old["account_id"],a["current_price"])
                 await con.execute("UPDATE shop.auctions SET current_price=$2,highest_bidder_id=$3 WHERE auction_id=$1",self.aid,amount,i.user.id)
                 await con.execute("INSERT INTO shop.auction_bids(auction_id,bidder_id,amount) VALUES($1,$2,$3)",self.aid,i.user.id,amount)
-        await refresh_auction_panel(i.guild);await i.response.send_message(f"💰 {fmt_money(amount,'PAL')} で入札しました。",ephemeral=True)
+        await refresh_auction_panel(i.guild);await i.followup.send(f"💰 {fmt_money(amount,'PAL')} で入札しました。",ephemeral=True)
 
 class AuctionActiveView(discord.ui.View):
     def __init__(self,aid):super().__init__(timeout=None);self.aid=int(aid)
@@ -1058,20 +1100,51 @@ class AuctionActiveView(discord.ui.View):
     async def bid(self,i,b):await i.response.send_modal(AuctionBidModal(self.aid))
 
 async def finish_auction(guild,aid):
-    a=await db.fetchrow("SELECT * FROM shop.auctions WHERE auction_id=$1",aid)
-    if not a or a["status"]!="ACTIVE":return
-    if not a["highest_bidder_id"]:
-        await db.execute("UPDATE shop.auctions SET status='NO_BIDS',completed_at=NOW() WHERE auction_id=$1",aid)
-    else:
-        tx=await db.fetchrow("INSERT INTO shop.transactions(guild_id,shop_id,product_id,buyer_id,seller_id,currency,shop_name_snapshot,product_name_snapshot,product_description_snapshot,price_snapshot,status) VALUES($1,NULL,NULL,$2,$3,'PAL','PAL 競り市場',$4,$5,$6,'SELLER_ACTION_REQUIRED') RETURNING *",a["guild_id"],a["highest_bidder_id"],a["seller_id"],a["product_name"],a["product_description"],a["current_price"])
-        await db.execute("INSERT INTO shop.escrows(transaction_id,currency,amount,status) VALUES($1,'PAL',$2,'HELD')",tx["transaction_id"],a["current_price"])
-        await db.execute("UPDATE shop.auctions SET status='COMPLETED',transaction_id=$2,completed_at=NOW() WHERE auction_id=$1",aid,tx["transaction_id"])
-        ch=await create_ticket(guild,tx);await db.execute("UPDATE shop.transactions SET ticket_channel_id=$2 WHERE transaction_id=$1",tx["transaction_id"],ch.id)
+    tx=None
+    async with db.acquire() as con:
+        async with con.transaction():
+            a=await con.fetchrow("SELECT * FROM shop.auctions WHERE auction_id=$1 FOR UPDATE",aid)
+            if not a or a["status"]!="ACTIVE":
+                return
+            if a["ends_at"]>datetime.now(timezone.utc):
+                return
+            if not a["highest_bidder_id"]:
+                await con.execute("UPDATE shop.auctions SET status='NO_BIDS',completed_at=NOW() WHERE auction_id=$1",aid)
+            else:
+                tx=await con.fetchrow("""INSERT INTO shop.transactions(
+                    guild_id,shop_id,product_id,buyer_id,seller_id,currency,
+                    shop_name_snapshot,product_name_snapshot,product_description_snapshot,price_snapshot,status)
+                    VALUES($1,NULL,NULL,$2,$3,'PAL','PAL 競り市場',$4,$5,$6,'SELLER_ACTION_REQUIRED')
+                    RETURNING *""",a["guild_id"],a["highest_bidder_id"],a["seller_id"],
+                    a["product_name"],a["product_description"],a["current_price"])
+                await con.execute("""INSERT INTO shop.escrows(
+                    transaction_id,buyer_id,seller_id,currency,amount,status)
+                    VALUES($1,$2,$3,'PAL',$4,'HELD')""",
+                    tx["transaction_id"],a["highest_bidder_id"],a["seller_id"],a["current_price"])
+                await con.execute("""UPDATE shop.auctions SET status='COMPLETED',
+                    transaction_id=$2,completed_at=NOW() WHERE auction_id=$1""",aid,tx["transaction_id"])
+    if tx:
+        try:
+            ch=await create_ticket(guild,tx)
+            await db.execute("UPDATE shop.transactions SET ticket_channel_id=$2 WHERE transaction_id=$1",tx["transaction_id"],ch.id)
+        except Exception:
+            log.exception("競り取引チケット作成失敗 transaction_id=%s",tx["transaction_id"])
     await refresh_auction_panel(guild)
 
 def schedule_auction(guild,aid,ends):
+    old=auction_tasks.pop(aid,None)
+    if old and not old.done():
+        old.cancel()
     async def run():
-        await asyncio.sleep(max(0,(ends-datetime.now(timezone.utc)).total_seconds()));await finish_auction(guild,aid)
+        try:
+            await asyncio.sleep(max(0,(ends-datetime.now(timezone.utc)).total_seconds()))
+            await finish_auction(guild,aid)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("競り終了処理失敗 auction_id=%s",aid)
+        finally:
+            auction_tasks.pop(aid,None)
     auction_tasks[aid]=asyncio.create_task(run())
 
 
@@ -1081,16 +1154,47 @@ async def setup_hook():
     bot.add_view(SetupView())
     bot.add_view(OpenShopPanel())
     bot.add_view(CasinoShopView())
-    shops=await db.fetch("SELECT shop_id FROM shop.shops WHERE shop_type='PAL' AND status<>'DELETED'")
-    for s in shops:bot.add_view(StoreView(s["shop_id"]))
-    txs=await db.fetch("""SELECT transaction_id FROM shop.transactions
-                          WHERE status NOT IN ('COMPLETED','REFUNDED','CANCELLED')""")
-    for t in txs:bot.add_view(TicketView(t["transaction_id"]))
-    log.info("DB・SHOP SYSTEM復旧完了")
+
+    shops=await db.fetch("""SELECT shop_id,panel_message_id FROM shop.shops
+                            WHERE shop_type='PAL' AND status<>'DELETED'
+                            AND panel_message_id IS NOT NULL""")
+    for s in shops:
+        bot.add_view(StoreView(s["shop_id"]),message_id=s["panel_message_id"])
+
+    txs=await db.fetch("""SELECT transaction_id,ticket_channel_id FROM shop.transactions
+                          WHERE status NOT IN ('COMPLETED','REFUNDED','CANCELLED')
+                          AND ticket_channel_id IS NOT NULL""")
+    for tx in txs:
+        bot.add_view(TicketView(tx["transaction_id"]))
+
+    systems=await db.fetch("""SELECT guild_id,auction_message_id FROM shop.systems
+                              WHERE status='ACTIVE' AND auction_message_id IS NOT NULL""")
+    for system in systems:
+        a=await db.fetchrow("SELECT auction_id FROM shop.auctions WHERE guild_id=$1 AND status='ACTIVE'",system["guild_id"])
+        view=AuctionActiveView(a["auction_id"]) if a else AuctionIdleView()
+        bot.add_view(view,message_id=system["auction_message_id"])
+    log.info("DB・SHOP SYSTEM永続View登録完了")
 
 @bot.event
 async def on_ready():
     log.info("PAL SHOP起動完了: %s",bot.user)
+    for guild in bot.guilds:
+        try:
+            await recover_pal_shops(guild)
+            a=await db.fetchrow("SELECT * FROM shop.auctions WHERE guild_id=$1 AND status='ACTIVE'",guild.id)
+            if a:
+                if a["ends_at"]<=datetime.now(timezone.utc):
+                    await finish_auction(guild,a["auction_id"])
+                else:
+                    schedule_auction(guild,a["auction_id"],a["ends_at"])
+            await refresh_auction_panel(guild)
+        except Exception:
+            log.exception("起動復旧失敗 guild=%s",guild.id)
+
+@bot.event
+async def on_error(event_method,*args,**kwargs):
+    log.exception("Discord event error: %s",event_method)
+
 
 @bot.command()
 @commands.has_permissions(administrator=True)

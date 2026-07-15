@@ -123,6 +123,8 @@ ALTER TABLE shop.transactions ADD COLUMN IF NOT EXISTS product_name_snapshot TEX
 ALTER TABLE shop.transactions ADD COLUMN IF NOT EXISTS product_description_snapshot TEXT;
 ALTER TABLE shop.transactions ADD COLUMN IF NOT EXISTS price_snapshot BIGINT;
 ALTER TABLE shop.transactions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
+ALTER TABLE shop.transactions ALTER COLUMN shop_id DROP NOT NULL;
+ALTER TABLE shop.transactions ALTER COLUMN product_id DROP NOT NULL;
 UPDATE shop.transactions SET currency='PAL' WHERE currency IS NULL;
 UPDATE shop.transactions SET updated_at=NOW() WHERE updated_at IS NULL;
 ALTER TABLE shop.transactions ALTER COLUMN currency SET DEFAULT 'PAL';
