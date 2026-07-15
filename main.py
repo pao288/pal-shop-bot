@@ -33,7 +33,7 @@ async def account_row(con, user_id, currency, lock=False):
     last = None
     for q in candidates:
         try:
-            return await con.fetchrow(q, user_id, currency)
+            return await con.fetchrow(q, str(user_id), currency)
         except Exception as e:
             last = e
     raise last
@@ -310,27 +310,116 @@ async def ensure_pal_forum(guild):
     system=await db.fetchrow("SELECT * FROM shop.systems WHERE guild_id=$1",guild.id)
     if not system or system["status"]!="ACTIVE": return None
     forum=guild.get_channel(system["pal_forum_channel_id"]) if system["pal_forum_channel_id"] else None
+    if forum is None and system["pal_forum_channel_id"]:
+        try:
+            forum=await guild.fetch_channel(system["pal_forum_channel_id"])
+        except (discord.NotFound,discord.Forbidden,discord.HTTPException):
+            forum=None
     if isinstance(forum,discord.ForumChannel): return forum
     category=guild.get_channel(system["pal_category_id"]) if system["pal_category_id"] else None
+    if category is None and system["pal_category_id"]:
+        try:
+            category=await guild.fetch_channel(system["pal_category_id"])
+        except (discord.NotFound,discord.Forbidden,discord.HTTPException):
+            category=None
     forum=await guild.create_forum("🏪｜PALショップ",category=category)
     await db.execute("UPDATE shop.systems SET pal_forum_channel_id=$2,updated_at=NOW() WHERE guild_id=$1",guild.id,forum.id)
     return forum
 
 async def restore_shop_thread(guild,shop):
-    if shop["shop_type"]!="PAL" or shop["status"]=="DELETED": return None
-    forum=await ensure_pal_forum(guild)
-    if not forum: return None
-    thread=guild.get_channel(shop["forum_thread_id"]) if shop["forum_thread_id"] else None
-    if isinstance(thread,discord.Thread) and shop["panel_message_id"]:
-        try:
-            await thread.fetch_message(shop["panel_message_id"])
-            return thread
-        except (discord.NotFound,discord.Forbidden,discord.HTTPException): pass
-    total=await db.fetchval("SELECT COUNT(*) FROM shop.products WHERE shop_id=$1 AND status='ACTIVE'",shop["shop_id"])
-    pages=max(1,(total+9)//10)
-    created=await forum.create_thread(name=f"🏪 {shop['name']}"[:100],embed=await store_embed(shop,0),view=StoreView(shop["shop_id"],0,pages))
-    await db.execute("""UPDATE shop.shops SET forum_thread_id=$2,panel_message_id=$3,updated_at=NOW()
-                        WHERE shop_id=$1""",shop["shop_id"],created.thread.id,created.message.id)
+    """DB上の既存PAL店舗を維持したまま、消えたDiscord店舗スレッドだけ復旧する。"""
+    if not shop or shop["shop_type"]!="PAL" or shop["status"]=="DELETED":
+        return None
+
+    forum = await ensure_pal_forum(guild)
+    if not forum:
+        return None
+
+    # 1. 既存スレッドをキャッシュ→APIの順で確認。
+    thread = None
+    old_thread_id = shop["forum_thread_id"]
+    if old_thread_id:
+        thread = guild.get_channel(old_thread_id)
+        if thread is None:
+            try:
+                fetched = await guild.fetch_channel(old_thread_id)
+                if isinstance(fetched, discord.Thread):
+                    thread = fetched
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                thread = None
+
+    # 2. スレッドが残っている場合はスターターメッセージを確認。
+    if isinstance(thread, discord.Thread):
+        panel = None
+        if shop["panel_message_id"]:
+            try:
+                panel = await thread.fetch_message(shop["panel_message_id"])
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                panel = None
+
+        total = await db.fetchval(
+            "SELECT COUNT(*) FROM shop.products WHERE shop_id=$1 AND status='ACTIVE'",
+            shop["shop_id"]
+        )
+        pages = max(1, (total + 9) // 10)
+
+        # スレッドはあるが店舗パネルだけ消えた場合は、新しいパネルを同じスレッドへ作る。
+        if panel is None:
+            panel = await thread.send(
+                embed=await store_embed(shop, 0),
+                view=StoreView(shop["shop_id"], 0, pages)
+            )
+            await db.execute(
+                """UPDATE shop.shops SET panel_message_id=$2,updated_at=NOW()
+                   WHERE shop_id=$1""",
+                shop["shop_id"], panel.id
+            )
+        else:
+            await panel.edit(
+                embed=await store_embed(shop, 0),
+                view=StoreView(shop["shop_id"], 0, pages)
+            )
+        return thread
+
+    # 3. Discord側の店舗スレッドだけ消えている。
+    #    shops/productsは一切DELETEせず、古いDiscord IDだけ先に解除して新規スレッドを作る。
+    await db.execute(
+        """UPDATE shop.shops
+           SET forum_thread_id=NULL,panel_message_id=NULL,updated_at=NOW()
+           WHERE shop_id=$1""",
+        shop["shop_id"]
+    )
+
+    total = await db.fetchval(
+        "SELECT COUNT(*) FROM shop.products WHERE shop_id=$1 AND status='ACTIVE'",
+        shop["shop_id"]
+    )
+    pages = max(1, (total + 9) // 10)
+
+    try:
+        created = await forum.create_thread(
+            name=f"🏪 {shop['name']}"[:100],
+            content=f"♻️ **{shop['name']}** の店舗を復旧しています..."
+        )
+        await created.message.edit(
+            content=None,
+            embed=await store_embed(shop, 0),
+            view=StoreView(shop["shop_id"], 0, pages)
+        )
+    except Exception:
+        log.exception(
+            "既存店舗スレッド再生成失敗 shop_id=%s old_thread_id=%s",
+            shop["shop_id"], old_thread_id
+        )
+        # 店舗・商品データは維持。Discord IDだけNULLのまま次回復旧可能にする。
+        raise
+
+    await db.execute(
+        """UPDATE shop.shops
+           SET forum_thread_id=$2,panel_message_id=$3,updated_at=NOW()
+           WHERE shop_id=$1""",
+        shop["shop_id"], created.thread.id, created.message.id
+    )
     return created.thread
 
 async def recover_pal_shops(guild):
@@ -372,25 +461,27 @@ class OpenShopModal(discord.ui.Modal, title="🏪 お店を開く"):
                             VALUES($1,$2,$3,$4,'PAL')""",
                          shop["shop_id"],self.product_name.value,self.product_description.value,price)
         try:
-            forum = await ensure_pal_forum(i.guild)
-            if not forum:
-                raise RuntimeError("PAL_FORUM_NOT_FOUND")
-            count = 1
-            created = await forum.create_thread(
-                name=f"🏪 {shop['name']}"[:100],
-                embed=await store_embed(shop,0),
-                view=StoreView(shop["shop_id"],0,max(1,(count+9)//10))
+            thread = await restore_shop_thread(i.guild, shop)
+            if not thread:
+                raise RuntimeError("SHOP_THREAD_RECOVERY_RETURNED_NONE")
+        except Exception as e:
+            log.exception("店舗新規作成後のスレッド生成失敗 shop_id=%s",shop["shop_id"])
+            return await i.followup.send(
+                f"店舗データと商品データは登録しました。店舗スレッド生成でエラーが出ています。\n"
+                f"もう一度「お店を開く」を押すと同じ店舗を復旧します。\n"
+                f"`{type(e).__name__}: {str(e)[:700]}`",
+                ephemeral=True
             )
-            thread = created.thread
-            msg = created.message
-            await db.execute("""UPDATE shop.shops SET forum_thread_id=$2,panel_message_id=$3,updated_at=NOW()
-                                WHERE shop_id=$1""", shop["shop_id"],thread.id,msg.id)
-        except Exception:
-            log.exception("店舗新規作成失敗 shop_id=%s",shop["shop_id"])
-            await db.execute("DELETE FROM shop.products WHERE shop_id=$1",shop["shop_id"])
-            await db.execute("DELETE FROM shop.shops WHERE shop_id=$1",shop["shop_id"])
-            return await i.followup.send("店舗作成処理を完了できませんでした。ログを確認してください。",ephemeral=True)
-        await i.followup.send(f"🏪 **{shop['name']}** を開店しました！", ephemeral=True)
+        v=discord.ui.View(timeout=300)
+        v.add_item(discord.ui.Button(label="お店を見る",emoji="🏪",url=thread.jump_url))
+        await i.followup.send(
+            embed=discord.Embed(
+                title="🏪 お店を開店しました",
+                description=f"**{shop['name']}**\n\n最初の商品も登録済みです。"
+            ),
+            view=v,
+            ephemeral=True
+        )
 
 class OpenShopPanel(discord.ui.View):
     def __init__(self): super().__init__(timeout=None)
@@ -405,10 +496,16 @@ class OpenShopPanel(discord.ui.View):
 
         await i.response.defer(ephemeral=True)
         try:
+            old_thread_id = shop["forum_thread_id"]
             thread=await restore_shop_thread(i.guild,shop)
-        except Exception:
+        except Exception as e:
             log.exception("店舗スレッド復旧失敗 shop_id=%s",shop["shop_id"])
-            return await i.followup.send("店舗の復旧処理でエラーが出ました。ログを確認してください。",ephemeral=True)
+            return await i.followup.send(
+                f"既存店舗のスレッド復旧でエラーが出ました。\n"
+                f"店舗・商品データはそのまま残っています。\n"
+                f"`{type(e).__name__}: {str(e)[:700]}`",
+                ephemeral=True
+            )
 
         if not thread:
             return await i.followup.send("店舗を復旧できませんでした。もう一度押してください。",ephemeral=True)
@@ -417,8 +514,8 @@ class OpenShopPanel(discord.ui.View):
         v.add_item(discord.ui.Button(label="お店を見る",emoji="🏪",url=thread.jump_url))
         await i.followup.send(
             embed=discord.Embed(
-                title="🏪 自分のお店",
-                description=f"**{shop['name']}**\n\n店舗スレッドを開けます。"
+                title="♻️ 店舗を復旧しました" if old_thread_id != thread.id else "🏪 自分のお店",
+                description=f"**{shop['name']}**\n\n既存の店舗データ・商品データを使って店舗スレッドを表示しています。"
             ),
             view=v,
             ephemeral=True
@@ -754,21 +851,52 @@ class PurchaseConfirmView(discord.ui.View):
         if int(p["price"]) != self.confirmed_price:
             return await i.followup.send(f"⚠️ 価格が変更されています。\n確認時: {fmt_money(self.confirmed_price,p['currency'])}\n現在: {fmt_money(p['price'],p['currency'])}\n\n購入ボタンから開き直してください。",ephemeral=True)
 
-        tx=await db.fetchrow("""INSERT INTO shop.transactions(
-            guild_id,shop_id,product_id,buyer_id,seller_id,currency,
-            shop_name_snapshot,product_name_snapshot,product_description_snapshot,price_snapshot,status)
-            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'PAYMENT_PENDING') RETURNING *""",
-            i.guild_id,p["shop_id"],p["product_id"],i.user.id,p["owner_id"],p["currency"],
-            p["shop_name"],p["name"],p["description"],p["price"])
-        ok,msg=await reserve_funds(tx["transaction_id"],i.user.id,p["owner_id"],p["currency"],p["price"])
+        try:
+            tx=await db.fetchrow("""INSERT INTO shop.transactions(
+                guild_id,shop_id,product_id,buyer_id,seller_id,currency,
+                shop_name_snapshot,product_name_snapshot,product_description_snapshot,price_snapshot,status)
+                VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'PAYMENT_PENDING') RETURNING *""",
+                i.guild_id,p["shop_id"],p["product_id"],i.user.id,p["owner_id"],p["currency"],
+                p["shop_name"],p["name"],p["description"],p["price"])
+            ok,msg=await reserve_funds(
+                tx["transaction_id"],i.user.id,p["owner_id"],p["currency"],p["price"]
+            )
+        except Exception as e:
+            log.exception("購入決済開始失敗 product_id=%s buyer_id=%s currency=%s",
+                          self.product_id,i.user.id,p["currency"])
+            return await i.followup.send(
+                f"購入処理エラー\n`{type(e).__name__}: {str(e)[:700]}`",
+                ephemeral=True
+            )
         if not ok:
-            await db.execute("UPDATE shop.transactions SET status='CANCELLED' WHERE transaction_id=$1",tx["transaction_id"])
-            return await i.followup.send(f"購入結果: `{msg}`",ephemeral=True)
+            await db.execute("UPDATE shop.transactions SET status='CANCELLED',updated_at=NOW() WHERE transaction_id=$1",tx["transaction_id"])
+            labels={
+                "INSUFFICIENT_BALANCE":"残高が不足しています。",
+                "MAINTENANCE":"BANKがメンテナンス中です。",
+            }
+            return await i.followup.send(
+                f"購入できませんでした。\n{labels.get(msg,msg)}",
+                ephemeral=True
+            )
         await db.execute("""UPDATE shop.transactions SET status='SELLER_ACTION_REQUIRED',updated_at=NOW()
                             WHERE transaction_id=$1""",tx["transaction_id"])
         tx=await db.fetchrow("SELECT * FROM shop.transactions WHERE transaction_id=$1",tx["transaction_id"])
-        ch=await create_ticket(i.guild,tx)
-        await db.execute("UPDATE shop.transactions SET ticket_channel_id=$2 WHERE transaction_id=$1",tx["transaction_id"],ch.id)
+        try:
+            ch=await create_ticket(i.guild,tx)
+            await db.execute("UPDATE shop.transactions SET ticket_channel_id=$2 WHERE transaction_id=$1",tx["transaction_id"],ch.id)
+        except Exception as e:
+            log.exception("購入後チケット作成失敗 transaction_id=%s",tx["transaction_id"])
+            ok_refund,refund_msg=await refund_funds(tx["transaction_id"])
+            if ok_refund:
+                await db.execute("UPDATE shop.transactions SET status='REFUNDED',updated_at=NOW() WHERE transaction_id=$1",tx["transaction_id"])
+            else:
+                await db.execute("UPDATE shop.transactions SET previous_status=status,status='STAFF_REVIEW',updated_at=NOW() WHERE transaction_id=$1",tx["transaction_id"])
+            return await i.followup.send(
+                f"取引チケット生成エラー\n"
+                f"`{type(e).__name__}: {str(e)[:700]}`\n"
+                f"返金処理: `{refund_msg}`",
+                ephemeral=True
+            )
         await i.followup.send(
             f"✅ **{p['name']}** を購入しました。\n🎫 取引チケット: {ch.mention}",
             ephemeral=True
@@ -787,20 +915,66 @@ class PurchaseConfirmView(discord.ui.View):
         )
 
 async def create_ticket(guild,tx):
-    system=await db.fetchrow("SELECT * FROM shop.systems WHERE guild_id=$1",guild.id)
+    system=await db.fetchrow("SELECT * FROM shop.systems WHERE guild_id=$1 AND status='ACTIVE'",guild.id)
+    if not system:
+        raise RuntimeError("SHOP_SYSTEM_NOT_FOUND")
+
     cat_id=system["pal_ticket_category_id"] if tx["currency"]=="PAL" else system["casino_ticket_category_id"]
+    if not cat_id:
+        raise RuntimeError(f"TICKET_CATEGORY_ID_NOT_SET:{tx['currency']}")
+
     cat=guild.get_channel(cat_id)
+    if cat is None:
+        try:
+            cat=await guild.fetch_channel(cat_id)
+        except (discord.NotFound,discord.Forbidden,discord.HTTPException) as e:
+            raise RuntimeError(f"TICKET_CATEGORY_NOT_FOUND:{cat_id}") from e
+    if not isinstance(cat,discord.CategoryChannel):
+        raise RuntimeError(f"TICKET_CATEGORY_INVALID:{cat_id}")
+
     overwrites={guild.default_role:discord.PermissionOverwrite(view_channel=False)}
+
     buyer=guild.get_member(tx["buyer_id"])
+    if buyer is None:
+        try: buyer=await guild.fetch_member(tx["buyer_id"])
+        except (discord.NotFound,discord.Forbidden,discord.HTTPException): buyer=None
+
     seller=guild.get_member(tx["seller_id"]) if tx["seller_id"] else None
-    if buyer:overwrites[buyer]=discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True)
-    if seller:overwrites[seller]=discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True)
+    if seller is None and tx["seller_id"]:
+        try: seller=await guild.fetch_member(tx["seller_id"])
+        except (discord.NotFound,discord.Forbidden,discord.HTTPException): seller=None
+
+    if buyer:
+        overwrites[buyer]=discord.PermissionOverwrite(
+            view_channel=True,send_messages=True,read_message_history=True
+        )
+    if seller:
+        overwrites[seller]=discord.PermissionOverwrite(
+            view_channel=True,send_messages=True,read_message_history=True
+        )
     for role in guild.roles:
         if role.permissions.administrator:
-            overwrites[role]=discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True)
-    overwrites[guild.me]=discord.PermissionOverwrite(view_channel=True,send_messages=True,manage_channels=True)
-    ch=await guild.create_text_channel(f"取引-{tx['transaction_id']:06d}",category=cat,overwrites=overwrites)
-    await ch.send(embed=ticket_embed(tx),view=TicketView(tx["transaction_id"]))
+            overwrites[role]=discord.PermissionOverwrite(
+                view_channel=True,send_messages=True,read_message_history=True
+            )
+
+    me=guild.me
+    if me:
+        overwrites[me]=discord.PermissionOverwrite(
+            view_channel=True,send_messages=True,read_message_history=True,manage_channels=True
+        )
+
+    ch=await guild.create_text_channel(
+        f"取引-{tx['transaction_id']:06d}",
+        category=cat,
+        overwrites=overwrites
+    )
+    try:
+        await ch.send(embed=ticket_embed(tx),view=TicketView(tx["transaction_id"]))
+    except Exception:
+        try: await ch.delete(reason="取引パネル生成失敗")
+        except Exception: pass
+        raise
     return ch
 
 def ticket_embed(tx):
