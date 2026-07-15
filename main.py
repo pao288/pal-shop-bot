@@ -305,6 +305,44 @@ class DeleteConfirmView(discord.ui.View):
         except Exception as e:
             await i.followup.send(f"削除エラー: `{type(e).__name__}: {e}`", ephemeral=True)
 
+
+async def ensure_pal_forum(guild):
+    system=await db.fetchrow("SELECT * FROM shop.systems WHERE guild_id=$1",guild.id)
+    if not system or system["status"]!="ACTIVE": return None
+    forum=guild.get_channel(system["pal_forum_channel_id"]) if system["pal_forum_channel_id"] else None
+    if isinstance(forum,discord.ForumChannel): return forum
+    category=guild.get_channel(system["pal_category_id"]) if system["pal_category_id"] else None
+    forum=await guild.create_forum("🏪｜PALショップ",category=category)
+    await db.execute("UPDATE shop.systems SET pal_forum_channel_id=$2,updated_at=NOW() WHERE guild_id=$1",guild.id,forum.id)
+    return forum
+
+async def restore_shop_thread(guild,shop):
+    if shop["shop_type"]!="PAL" or shop["status"]=="DELETED": return None
+    forum=await ensure_pal_forum(guild)
+    if not forum: return None
+    thread=guild.get_channel(shop["forum_thread_id"]) if shop["forum_thread_id"] else None
+    if isinstance(thread,discord.Thread) and shop["panel_message_id"]:
+        try:
+            await thread.fetch_message(shop["panel_message_id"])
+            return thread
+        except (discord.NotFound,discord.Forbidden,discord.HTTPException): pass
+    total=await db.fetchval("SELECT COUNT(*) FROM shop.products WHERE shop_id=$1 AND status='ACTIVE'",shop["shop_id"])
+    pages=max(1,(total+9)//10)
+    created=await forum.create_thread(name=f"🏪 {shop['name']}"[:100],embed=await store_embed(shop,0),view=StoreView(shop["shop_id"],0,pages))
+    await db.execute("""UPDATE shop.shops SET forum_thread_id=$2,panel_message_id=$3,updated_at=NOW()
+                        WHERE shop_id=$1""",shop["shop_id"],created.thread.id,created.message.id)
+    return created.thread
+
+async def recover_pal_shops(guild):
+    system=await db.fetchrow("SELECT * FROM shop.systems WHERE guild_id=$1",guild.id)
+    if not system or system["status"]!="ACTIVE": return
+    await ensure_pal_forum(guild)
+    shops=await db.fetch("""SELECT * FROM shop.shops WHERE guild_id=$1 AND shop_type='PAL'
+                            AND status<>'DELETED' ORDER BY shop_id""",guild.id)
+    for shop in shops:
+        try: await restore_shop_thread(guild,shop)
+        except Exception: logger.exception("PAL店舗復旧失敗 shop_id=%s",shop["shop_id"])
+
 class OpenShopModal(discord.ui.Modal, title="🏪 お店を開く"):
     shop_name = discord.ui.TextInput(label="店名", max_length=80)
     shop_description = discord.ui.TextInput(label="店の説明", style=discord.TextStyle.paragraph, max_length=1000)
@@ -347,13 +385,19 @@ class OpenShopModal(discord.ui.Modal, title="🏪 お店を開く"):
         await i.followup.send(f"🏪 **{shop['name']}** を開店しました！", ephemeral=True)
 
 class OpenShopPanel(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
+    def __init__(self): super().__init__(timeout=None)
 
-    @discord.ui.button(label="お店を開く", emoji="🏪", style=discord.ButtonStyle.primary, custom_id="shop:pal:open")
-    async def open(self, i, b):
-        await i.response.send_modal(OpenShopModal())
-
+    @discord.ui.button(label="お店を開く",emoji="🏪",style=discord.ButtonStyle.success,custom_id="shop:open")
+    async def open_shop(self,i,b):
+        shop=await db.fetchrow("""SELECT * FROM shop.shops WHERE guild_id=$1 AND owner_id=$2
+                                  AND shop_type='PAL' AND status<>'DELETED'
+                                  ORDER BY shop_id DESC LIMIT 1""",i.guild_id,i.user.id)
+        if not shop: return await i.response.send_modal(OpenShopModal())
+        thread=await restore_shop_thread(i.guild,shop)
+        if not thread: return await i.response.send_message("店舗を復旧できませんでした。もう一度押してください。",ephemeral=True)
+        v=discord.ui.View(timeout=300)
+        v.add_item(discord.ui.Button(label="お店を見る",emoji="🏪",url=thread.jump_url))
+        await i.response.send_message(embed=discord.Embed(title="♻️ お店を復旧しました",description=f"🏪 **{shop['name']}**\n\n店舗スレッドを確認できます。"),view=v,ephemeral=True)
 
 class AddProductModal(discord.ui.Modal):
     name = discord.ui.TextInput(label="商品名", max_length=100)
@@ -883,16 +927,23 @@ async def refresh_casino_panel(guild):
 
 async def refresh_store(guild,shop_id):
     s=await db.fetchrow("SELECT * FROM shop.shops WHERE shop_id=$1",shop_id)
-    if not s or s["shop_type"]!="PAL" or not s["forum_thread_id"] or not s["panel_message_id"]:return
-    count=await db.fetchrow("""SELECT COUNT(*) c FROM shop.products WHERE shop_id=$1 AND status<>'DELETED'""",shop_id)
-    thread=guild.get_channel(s["forum_thread_id"])
-    if thread:
-        try:
-            m=await thread.fetch_message(s["panel_message_id"])
-            total=await db.fetchval("SELECT COUNT(*) FROM shop.products WHERE shop_id=$1 AND status='ACTIVE'",shop_id)
-            await m.edit(embed=await store_embed(s,0),view=StoreView(shop_id,0,max(1,(total+9)//10)))
-        except discord.NotFound:
-            pass
+    if not s or s["status"]=="DELETED": return
+    if s["shop_type"]=="PAL":
+        thread=await restore_shop_thread(guild,s)
+        if not thread: return
+        s=await db.fetchrow("SELECT * FROM shop.shops WHERE shop_id=$1",shop_id)
+    else:
+        thread=guild.get_channel(s["forum_thread_id"]) if s["forum_thread_id"] else None
+        if not thread: return
+    try:
+        m=await thread.fetch_message(s["panel_message_id"])
+        total=await db.fetchval("SELECT COUNT(*) FROM shop.products WHERE shop_id=$1 AND status='ACTIVE'",shop_id)
+        await m.edit(embed=await store_embed(s,0),view=StoreView(shop_id,0,max(1,(total+9)//10)))
+    except (discord.NotFound,discord.Forbidden,discord.HTTPException):
+        if s["shop_type"]=="PAL":
+            await db.execute("UPDATE shop.shops SET panel_message_id=NULL,forum_thread_id=NULL WHERE shop_id=$1",shop_id)
+            await restore_shop_thread(guild,await db.fetchrow("SELECT * FROM shop.shops WHERE shop_id=$1",shop_id))
+
 
 async def refresh_ticket(channel,txid):
     tx=await db.fetchrow("SELECT * FROM shop.transactions WHERE transaction_id=$1",txid)
@@ -939,22 +990,40 @@ class AuctionCreateModal(discord.ui.Modal,title="🔨 競りを開始"):
     product_name=discord.ui.TextInput(label="商品名",max_length=100)
     product_description=discord.ui.TextInput(label="商品説明",style=discord.TextStyle.paragraph,max_length=1500)
     start_price=discord.ui.TextInput(label="開始価格 PAL",max_length=18)
-    ends_at=discord.ui.TextInput(label="終了日時 例 2026/07/15 23:00",max_length=16)
     async def on_submit(self,i):
         try:
-            price=int(self.start_price.value.replace(",","")); ends=parse_jst_datetime(self.ends_at.value)
-            if price<1 or ends<=datetime.now(timezone.utc):raise ValueError
-        except ValueError:return await i.response.send_message("開始価格と未来の終了日時を確認してください。",ephemeral=True)
-        if await db.fetchrow("SELECT 1 FROM shop.auctions WHERE guild_id=$1 AND status='ACTIVE'",i.guild_id):return await i.response.send_message("現在競りが開催されています。",ephemeral=True)
-        await i.response.send_message(embed=discord.Embed(title="🔨 競りを開始しますか？",description=f"📦 商品\n{self.product_name.value}\n\n📝 商品説明\n{self.product_description.value}\n\n💰 開始価格\n{fmt_money(price,'PAL')}\n\n⏰ 終了\n{ends.astimezone(JST).strftime('%Y年%m月%d日 %H:%M')}"),view=AuctionConfirmView(self.product_name.value,self.product_description.value,price,ends),ephemeral=True)
+            price=int(self.start_price.value.replace(",","").strip())
+            if price<1: raise ValueError
+        except ValueError: return await i.response.send_message("開始価格は1 PAL以上の整数で入力してください。",ephemeral=True)
+        if await db.fetchrow("SELECT 1 FROM shop.auctions WHERE guild_id=$1 AND status='ACTIVE'",i.guild_id):
+            return await i.response.send_message("現在競りが開催されています。",ephemeral=True)
+        await i.response.send_message(embed=discord.Embed(title="⏰ 競り時間を選択",description=f"📦 商品\n{self.product_name.value}\n\n📝 商品説明\n{self.product_description.value}\n\n💰 開始価格\n{fmt_money(price,'PAL')}\n\nこの競りを何時間開催しますか？"),view=AuctionDurationView(self.product_name.value,self.product_description.value,price),ephemeral=True)
+
+class AuctionDurationView(discord.ui.View):
+    def __init__(self,n,d,p): super().__init__(timeout=300);self.n=n;self.d=d;self.p=int(p)
+    async def choose(self,i,hours):
+        ends=datetime.now(timezone.utc)+timedelta(hours=hours)
+        await i.response.edit_message(embed=discord.Embed(title="🔨 競りを開始しますか？",description=f"📦 商品\n{self.n}\n\n📝 商品説明\n{self.d}\n\n💰 開始価格\n{fmt_money(self.p,'PAL')}\n\n⏳ 開催時間\n{hours}時間\n\n⏰ 終了予定\n{ends.astimezone(JST).strftime('%Y年%m月%d日 %H:%M')}"),view=AuctionConfirmView(self.n,self.d,self.p,ends))
+    @discord.ui.button(label="1時間",emoji="1️⃣",style=discord.ButtonStyle.primary)
+    async def one(self,i,b): await self.choose(i,1)
+    @discord.ui.button(label="6時間",emoji="6️⃣",style=discord.ButtonStyle.primary)
+    async def six(self,i,b): await self.choose(i,6)
+    @discord.ui.button(label="24時間",emoji="🕛",style=discord.ButtonStyle.primary)
+    async def day(self,i,b): await self.choose(i,24)
 
 class AuctionConfirmView(discord.ui.View):
-    def __init__(self,n,d,p,e):super().__init__(timeout=300);self.n=n;self.d=d;self.p=p;self.e=e
+    def __init__(self,n,d,p,e): super().__init__(timeout=300);self.n=n;self.d=d;self.p=p;self.e=e
     @discord.ui.button(label="競り開始",emoji="🔨",style=discord.ButtonStyle.success)
     async def confirm(self,i,b):
-        try:a=await db.fetchrow("INSERT INTO shop.auctions(guild_id,seller_id,product_name,product_description,start_price,current_price,ends_at,status) VALUES($1,$2,$3,$4,$5,$5,$6,'ACTIVE') RETURNING *",i.guild_id,i.user.id,self.n,self.d,self.p,self.e)
-        except Exception:return await i.response.send_message("現在競りが開催されています。",ephemeral=True)
-        schedule_auction(i.guild,a["auction_id"],a["ends_at"]);await refresh_auction_panel(i.guild);await i.response.edit_message(content="🔨 競りを開始しました。",embed=None,view=None)
+        try:
+            a=await db.fetchrow("""INSERT INTO shop.auctions(guild_id,seller_id,product_name,product_description,
+                start_price,current_price,ends_at,status) VALUES($1,$2,$3,$4,$5,$5,$6,'ACTIVE') RETURNING *""",
+                i.guild_id,i.user.id,self.n,self.d,self.p,self.e)
+        except Exception: return await i.response.send_message("現在競りが開催されています。",ephemeral=True)
+        schedule_auction(i.guild,a["auction_id"],a["ends_at"]);await refresh_auction_panel(i.guild)
+        await i.response.edit_message(content="🔨 競りを開始しました。",embed=None,view=None)
+    @discord.ui.button(label="キャンセル",emoji="✖️",style=discord.ButtonStyle.secondary)
+    async def cancel(self,i,b): await i.response.edit_message(content="競りの開始をキャンセルしました。",embed=None,view=None)
 
 class AuctionIdleView(discord.ui.View):
     def __init__(self):super().__init__(timeout=None)
