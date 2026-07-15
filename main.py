@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+from zoneinfo import ZoneInfo
 import discord
 from discord.ext import commands
 import shop_db as db
@@ -154,67 +155,61 @@ def product_embed(product, shop):
     e.add_field(name="📌 商品状態", value=state, inline=False)
     return e
 
-def store_embed(shop, count=0):
-    state = "🟢 営業中" if shop["status"] == "ACTIVE" else "🔴 閉店中"
-    return discord.Embed(
-        title=f"🏪 {shop['name']}",
-        description=(
-            f"👤 店主\n<@{shop['owner_id']}>\n\n"
-            f"📝 店舗説明\n{shop['description']}\n\n"
-            f"📦 商品\n{count}件\n\n{state}"
-        )
-    )
+async def store_embed(shop,page=0):
+    total=await db.fetchval("SELECT COUNT(*) FROM shop.products WHERE shop_id=$1 AND status='ACTIVE'",shop["shop_id"])
+    pages=max(1,(total+9)//10); page=max(0,min(page,pages-1))
+    rows=await db.fetch("""SELECT * FROM shop.products WHERE shop_id=$1 AND status='ACTIVE'
+                           ORDER BY product_id ASC OFFSET $2 LIMIT 10""",shop["shop_id"],page*10)
+    products="\n\n".join(f"📦 **{x['name']}**\n💰 {fmt_money(x['price'],x['currency'])}" for x in rows) if rows else "現在販売中の商品はありません。"
+    return discord.Embed(title=f"🏪 {shop['name']}",description=(
+        f"👤 店主\n<@{shop['owner_id']}>\n\n📝 店舗説明\n{shop['description']}\n\n"
+        f"📦 販売中の商品\n{products}\n\n📄 {page+1} / {pages}ページ"))
+
 
 async def create_system(guild):
-    current = await db.fetchrow("SELECT * FROM shop.systems WHERE guild_id=$1", guild.id)
-    if current and current["status"] == "ACTIVE":
-        return current
+    current=await db.fetchrow("SELECT * FROM shop.systems WHERE guild_id=$1",guild.id)
+    if current and current["status"]=="ACTIVE": return current
 
-    pal_cat = await guild.create_category("🏪 PAL SHOP")
-    pal_open = await guild.create_text_channel("🛍️｜ショップを開く", category=pal_cat)
-    pal_announce = await guild.create_text_channel("📢｜商品追加", category=pal_cat)
-    pal_forum = await guild.create_forum("🏪｜PALショップ", category=pal_cat)
+    pal_cat=await guild.create_category("🏪 PAL SHOP")
+    pal_open=await guild.create_text_channel("🛍️｜ショップを開く",category=pal_cat)
+    pal_announce=await guild.create_text_channel("📢｜商品追加",category=pal_cat)
+    pal_forum=await guild.create_forum("🏪｜PALショップ",category=pal_cat)
+    auction_channel=await guild.create_text_channel("🔨｜PAL競り市場",category=pal_cat)
 
-    casino_cat = await guild.create_category("🎰 CASINO SHOP")
-    casino_channel = await guild.create_text_channel("🛒｜カジノショップ", category=casino_cat)
-    casino_announce = await guild.create_text_channel("📢｜カジノ商品追加", category=casino_cat)
+    casino_cat=await guild.create_category("🎰 CASINO SHOP")
+    casino_channel=await guild.create_text_channel("🛒｜カジノショップ",category=casino_cat)
+    casino_announce=await guild.create_text_channel("📢｜カジノ商品追加",category=casino_cat)
 
-    hidden = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True)
-    }
-    pal_ticket = await guild.create_category("🎫 PAL SHOP TICKET", overwrites=hidden)
-    casino_ticket = await guild.create_category("🎫 CASINO SHOP TICKET", overwrites=hidden)
+    hidden={guild.default_role:discord.PermissionOverwrite(view_channel=False),
+            guild.me:discord.PermissionOverwrite(view_channel=True,send_messages=True,manage_channels=True)}
+    pal_ticket=await guild.create_category("🎫 PAL SHOP TICKET",overwrites=hidden)
+    casino_ticket=await guild.create_category("🎫 CASINO SHOP TICKET",overwrites=hidden)
 
-    casino_shop = await db.fetchrow("""INSERT INTO shop.shops(
+    casino_shop=await db.fetchrow("""INSERT INTO shop.shops(
         guild_id,shop_type,owner_id,owner_type,is_official,name,description,status)
         VALUES($1,'CASINO',$2,'BOT',TRUE,'PAL CASINO SHOP',
-        'CHIPで商品を購入できる公式カジノショップです。','ACTIVE')
-        RETURNING *""", guild.id, bot.user.id)
+        'CHIPで商品を購入できる公式カジノショップです。','ACTIVE') RETURNING *""",guild.id,bot.user.id)
 
     await db.execute("""INSERT INTO shop.systems(
         guild_id,status,pal_category_id,pal_open_channel_id,pal_announce_channel_id,
         pal_forum_channel_id,casino_category_id,casino_channel_id,casino_announce_channel_id,
-        pal_ticket_category_id,casino_ticket_category_id,casino_shop_id)
-        VALUES($1,'ACTIVE',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-        ON CONFLICT(guild_id) DO UPDATE SET
-        status='ACTIVE',pal_category_id=EXCLUDED.pal_category_id,
-        pal_open_channel_id=EXCLUDED.pal_open_channel_id,
-        pal_announce_channel_id=EXCLUDED.pal_announce_channel_id,
-        pal_forum_channel_id=EXCLUDED.pal_forum_channel_id,
-        casino_category_id=EXCLUDED.casino_category_id,
-        casino_channel_id=EXCLUDED.casino_channel_id,
+        pal_ticket_category_id,casino_ticket_category_id,casino_shop_id,auction_channel_id)
+        VALUES($1,'ACTIVE',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+        ON CONFLICT(guild_id) DO UPDATE SET status='ACTIVE',
+        pal_category_id=EXCLUDED.pal_category_id,pal_open_channel_id=EXCLUDED.pal_open_channel_id,
+        pal_announce_channel_id=EXCLUDED.pal_announce_channel_id,pal_forum_channel_id=EXCLUDED.pal_forum_channel_id,
+        casino_category_id=EXCLUDED.casino_category_id,casino_channel_id=EXCLUDED.casino_channel_id,
         casino_announce_channel_id=EXCLUDED.casino_announce_channel_id,
-        pal_ticket_category_id=EXCLUDED.pal_ticket_category_id,
-        casino_ticket_category_id=EXCLUDED.casino_ticket_category_id,
-        casino_shop_id=EXCLUDED.casino_shop_id,updated_at=NOW()""",
-        guild.id,pal_cat.id,pal_open.id,pal_announce.id,pal_forum.id,
-        casino_cat.id,casino_channel.id,casino_announce.id,pal_ticket.id,
-        casino_ticket.id,casino_shop["shop_id"])
+        pal_ticket_category_id=EXCLUDED.pal_ticket_category_id,casino_ticket_category_id=EXCLUDED.casino_ticket_category_id,
+        casino_shop_id=EXCLUDED.casino_shop_id,auction_channel_id=EXCLUDED.auction_channel_id,updated_at=NOW()""",
+        guild.id,pal_cat.id,pal_open.id,pal_announce.id,pal_forum.id,casino_cat.id,casino_channel.id,
+        casino_announce.id,pal_ticket.id,casino_ticket.id,casino_shop["shop_id"],auction_channel.id)
 
-    await pal_open.send(embed=pal_open_embed(), view=OpenShopPanel())
-    await casino_channel.send(embed=await casino_embed(guild.id), view=CasinoShopView())
-    return await db.fetchrow("SELECT * FROM shop.systems WHERE guild_id=$1", guild.id)
+    await pal_open.send(embed=pal_open_embed(),view=OpenShopPanel())
+    await casino_channel.send(embed=await casino_embed(guild.id),view=CasinoShopView())
+    am=await auction_channel.send(embed=auction_idle_embed(),view=AuctionIdleView())
+    await db.execute("UPDATE shop.systems SET auction_message_id=$2,updated_at=NOW() WHERE guild_id=$1",guild.id,am.id)
+    return await db.fetchrow("SELECT * FROM shop.systems WHERE guild_id=$1",guild.id)
 
 async def delete_system(guild):
     system = await db.fetchrow("SELECT * FROM shop.systems WHERE guild_id=$1", guild.id)
@@ -342,8 +337,8 @@ class OpenShopModal(discord.ui.Modal, title="🏪 お店を開く"):
         count = 1
         created = await forum.create_thread(
             name=f"🏪 {shop['name']}",
-            embed=store_embed(shop,count),
-            view=StoreView(shop["shop_id"])
+            embed=await store_embed(shop,0),
+            view=StoreView(shop["shop_id"],0,max(1,(count+9)//10))
         )
         thread = created.thread
         msg = created.message
@@ -359,17 +354,6 @@ class OpenShopPanel(discord.ui.View):
     async def open(self, i, b):
         await i.response.send_modal(OpenShopModal())
 
-    @discord.ui.button(label="自分のお店", emoji="📦", style=discord.ButtonStyle.secondary, custom_id="shop:pal:mine")
-    async def mine(self, i, b):
-        shop = await db.fetchrow("""SELECT * FROM shop.shops WHERE guild_id=$1 AND owner_id=$2
-                                    AND shop_type='PAL' AND status<>'DELETED'""",i.guild_id,i.user.id)
-        if not shop:
-            return await i.response.send_message("まだPAL店舗を持っていません。", ephemeral=True)
-        thread = i.guild.get_channel(shop["forum_thread_id"]) if shop["forum_thread_id"] else None
-        await i.response.send_message(
-            f"🏪 **{shop['name']}**\n状態: **{shop['status']}**" + (f"\n{thread.mention}" if thread else ""),
-            view=StoreManageView(shop["shop_id"]), ephemeral=True
-        )
 
 class AddProductModal(discord.ui.Modal):
     name = discord.ui.TextInput(label="商品名", max_length=100)
@@ -419,28 +403,30 @@ class AddProductModal(discord.ui.Modal):
         )
 
 class StoreView(discord.ui.View):
-    def __init__(self, shop_id):
-        super().__init__(timeout=None)
-        self.shop_id = int(shop_id)
-        self.children[0].custom_id=f"shop:store:products:{self.shop_id}"
-        self.children[1].custom_id=f"shop:store:info:{self.shop_id}"
-        self.children[2].custom_id=f"shop:store:manage:{self.shop_id}"
-
-    @discord.ui.button(label="商品一覧", emoji="📦", style=discord.ButtonStyle.primary, custom_id="shop:store:products")
-    async def products(self, i, b):
-        await show_products(i,self.shop_id)
-
-    @discord.ui.button(label="店舗情報", emoji="ℹ️", style=discord.ButtonStyle.secondary, custom_id="shop:store:info")
-    async def info(self, i, b):
+    def __init__(self,shop_id,page=0,pages=1):
+        super().__init__(timeout=None); self.shop_id=int(shop_id); self.page=page; self.pages=max(1,pages)
+        self.prev.disabled=page<=0; self.next.disabled=page>=self.pages-1
+    @discord.ui.button(label="前へ",emoji="◀️",style=discord.ButtonStyle.secondary,custom_id="shop:store:prev",row=0)
+    async def prev(self,i,b): await edit_store_page(i,self.shop_id,self.page-1)
+    @discord.ui.button(label="購入",emoji="🛒",style=discord.ButtonStyle.success,custom_id="shop:store:buy",row=0)
+    async def buy(self,i,b): await show_purchase_panel(i,self.shop_id)
+    @discord.ui.button(label="次へ",emoji="▶️",style=discord.ButtonStyle.secondary,custom_id="shop:store:next",row=0)
+    async def next(self,i,b): await edit_store_page(i,self.shop_id,self.page+1)
+    @discord.ui.button(label="店舗情報",emoji="ℹ️",style=discord.ButtonStyle.secondary,custom_id="shop:store:info",row=1)
+    async def info(self,i,b):
         s=await db.fetchrow("SELECT * FROM shop.shops WHERE shop_id=$1",self.shop_id)
-        await i.response.send_message(f"🏪 **{s['name']}**\n\n{s['description']}\n\n👤 <@{s['owner_id']}>",ephemeral=True)
-
-    @discord.ui.button(label="店舗管理", emoji="⚙️", style=discord.ButtonStyle.secondary, custom_id="shop:store:manage")
-    async def manage(self, i, b):
+        await i.response.send_message(embed=discord.Embed(title=f"ℹ️ {s['name']}",description=s["description"]),ephemeral=True)
+    @discord.ui.button(label="店舗管理",emoji="⚙️",style=discord.ButtonStyle.primary,custom_id="shop:store:manage",row=1)
+    async def manage(self,i,b):
         s=await db.fetchrow("SELECT * FROM shop.shops WHERE shop_id=$1",self.shop_id)
-        if i.user.id != s["owner_id"] and not is_admin(i.user):
-            return await i.response.send_message("店主用です。",ephemeral=True)
+        if not s or (i.user.id!=s["owner_id"] and not is_admin(i.user)): return await i.response.send_message("店主用です。",ephemeral=True)
         await i.response.send_message("⚙️ 店舗管理",view=StoreManageView(self.shop_id),ephemeral=True)
+
+async def edit_store_page(i,shop_id,page):
+    s=await db.fetchrow("SELECT * FROM shop.shops WHERE shop_id=$1",shop_id)
+    total=await db.fetchval("SELECT COUNT(*) FROM shop.products WHERE shop_id=$1 AND status='ACTIVE'",shop_id)
+    pages=max(1,(total+9)//10); page=max(0,min(page,pages-1))
+    await i.response.edit_message(embed=await store_embed(s,page),view=StoreView(shop_id,page,pages))
 
 class EditShopModal(discord.ui.Modal, title="✏️ 店舗情報を変更"):
     shop_name = discord.ui.TextInput(label="新しい店名", max_length=80)
@@ -517,15 +503,6 @@ class StoreManageView(discord.ui.View):
             return await i.response.send_message("店主用です。",ephemeral=True)
         await i.response.send_modal(EditShopModal(s))
 
-    @discord.ui.button(label="閉店 / 営業再開",emoji="🔁",style=discord.ButtonStyle.secondary)
-    async def toggle(self,i,b):
-        if not await self.owner_check(i):
-            return await i.response.send_message("店主用です。",ephemeral=True)
-        s=await db.fetchrow("SELECT * FROM shop.shops WHERE shop_id=$1",self.shop_id)
-        new="CLOSED" if s["status"]=="ACTIVE" else "ACTIVE"
-        await db.execute("UPDATE shop.shops SET status=$2,updated_at=NOW() WHERE shop_id=$1",self.shop_id,new)
-        await refresh_store(i.guild,self.shop_id)
-        await i.response.send_message(f"店舗状態: **{new}**",ephemeral=True)
 
     @discord.ui.button(label="店舗を削除",emoji="🗑️",style=discord.ButtonStyle.danger)
     async def delete_shop(self,i,b):
@@ -539,7 +516,7 @@ class CasinoShopView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="商品を見る",emoji="📦",style=discord.ButtonStyle.primary,custom_id="shop:casino:products")
+    @discord.ui.button(label="購入",emoji="🛒",style=discord.ButtonStyle.success,custom_id="shop:casino:products")
     async def products(self,i,b):
         system=await db.fetchrow("SELECT * FROM shop.systems WHERE guild_id=$1",i.guild_id)
         shop=await db.fetchrow("""SELECT * FROM shop.shops WHERE guild_id=$1 AND shop_type='CASINO'
@@ -550,7 +527,7 @@ class CasinoShopView(discord.ui.View):
         if system and system["casino_shop_id"] != shop["shop_id"]:
             await db.execute("UPDATE shop.systems SET casino_shop_id=$2,updated_at=NOW() WHERE guild_id=$1",
                              i.guild_id,shop["shop_id"])
-        await show_products(i,shop["shop_id"])
+        await show_purchase_panel(i, shop["shop_id"])
 
 class CasinoAdminView(discord.ui.View):
     def __init__(self,shop_id):
@@ -579,6 +556,34 @@ class CasinoAdminView(discord.ui.View):
                     await m.edit(embed=e,view=CasinoShopView())
                     break
         await i.response.send_message(f"CASINO SHOP状態: **{new}**",ephemeral=True)
+
+async def show_purchase_panel(i, shop_id):
+    shop = await db.fetchrow("SELECT * FROM shop.shops WHERE shop_id=$1", shop_id)
+    if not shop or shop["status"] != "ACTIVE":
+        return await i.response.send_message("現在このSHOPは休止中です。", ephemeral=True)
+
+    rows = await db.fetch("""SELECT * FROM shop.products
+                             WHERE shop_id=$1 AND status='ACTIVE'
+                             ORDER BY product_id ASC LIMIT 25""", shop_id)
+    if not rows:
+        return await i.response.send_message("販売中の商品はありません。", ephemeral=True)
+
+    product_text = "\n\n".join(
+        f"📦 **{r['name']}**\n💰 {fmt_money(r['price'], r['currency'])}"
+        for r in rows
+    )
+    e = discord.Embed(
+        title=f"🛒 {shop['name']}｜商品購入",
+        description=(
+            f"購入する商品を下の選択欄から選んでください。\n\n"
+            f"📦 販売中の商品\n{product_text}"
+        )
+    )
+    await i.response.send_message(
+        embed=e,
+        view=ProductSelectView(rows),
+        ephemeral=True
+    )
 
 async def show_products(i,shop_id):
     shop=await db.fetchrow("SELECT * FROM shop.shops WHERE shop_id=$1",shop_id)
@@ -656,14 +661,15 @@ class BuyView(discord.ui.View):
         )
         await i.response.send_message(
             embed=e,
-            view=PurchaseConfirmView(self.product_id),
+            view=PurchaseConfirmView(self.product_id,p['price']),
             ephemeral=True
         )
 
 class PurchaseConfirmView(discord.ui.View):
-    def __init__(self, product_id):
+    def __init__(self, product_id, confirmed_price):
         super().__init__(timeout=300)
         self.product_id = int(product_id)
+        self.confirmed_price = int(confirmed_price)
 
     @discord.ui.button(label="この商品を購入する",emoji="✅",style=discord.ButtonStyle.success)
     async def confirm(self,i,b):
@@ -675,6 +681,8 @@ class PurchaseConfirmView(discord.ui.View):
             return await i.followup.send("現在購入できません。",ephemeral=True)
         if p["owner_id"] == i.user.id:
             return await i.followup.send("自分の商品です。",ephemeral=True)
+        if int(p["price"]) != self.confirmed_price:
+            return await i.followup.send(f"⚠️ 価格が変更されています。\n確認時: {fmt_money(self.confirmed_price,p['currency'])}\n現在: {fmt_money(p['price'],p['currency'])}\n\n購入ボタンから開き直してください。",ephemeral=True)
 
         tx=await db.fetchrow("""INSERT INTO shop.transactions(
             guild_id,shop_id,product_id,buyer_id,seller_id,currency,
@@ -816,31 +824,44 @@ class ProductAdminView(discord.ui.View):
         super().__init__(timeout=300)
         self.add_item(ProductAdminSelect(rows))
 
+class EditProductModal(discord.ui.Modal,title="✏️ 商品情報を変更"):
+    product_name=discord.ui.TextInput(label="商品名",max_length=100)
+    product_description=discord.ui.TextInput(label="商品説明",style=discord.TextStyle.paragraph,max_length=1500)
+    product_price=discord.ui.TextInput(label="価格",max_length=18)
+    def __init__(self,p):
+        super().__init__(); self.product_id=int(p["product_id"])
+        self.product_name.default=p["name"]; self.product_description.default=p["description"]; self.product_price.default=str(p["price"])
+    async def on_submit(self,i):
+        try:
+            price=int(self.product_price.value.replace(",","")); assert price>=1
+        except: return await i.response.send_message("価格は1以上の整数で入力してください。",ephemeral=True)
+        await db.execute("UPDATE shop.products SET name=$2,description=$3,price=$4,updated_at=NOW() WHERE product_id=$1",self.product_id,self.product_name.value,self.product_description.value,price)
+        p=await db.fetchrow("SELECT * FROM shop.products WHERE product_id=$1",self.product_id)
+        await refresh_store(i.guild,p["shop_id"]); s=await db.fetchrow("SELECT * FROM shop.shops WHERE shop_id=$1",p["shop_id"])
+        if s and s["shop_type"]=="CASINO": await refresh_casino_panel(i.guild)
+        await i.response.send_message("✏️ 商品情報を更新しました。",ephemeral=True)
+
 class ProductActionView(discord.ui.View):
-    def __init__(self,pid):
-        super().__init__(timeout=300)
-        self.pid=int(pid)
-
-    @discord.ui.button(label="販売停止 / 再開",emoji="🔁",style=discord.ButtonStyle.secondary)
+    def __init__(self,product_id): super().__init__(timeout=300); self.product_id=int(product_id)
+    @discord.ui.button(label="商品情報・価格変更",emoji="✏️",style=discord.ButtonStyle.primary)
+    async def edit(self,i,b):
+        p=await db.fetchrow("SELECT * FROM shop.products WHERE product_id=$1",self.product_id)
+        await i.response.send_modal(EditProductModal(p))
+    @discord.ui.button(label="販売停止 / 再開",emoji="⏯️",style=discord.ButtonStyle.secondary)
     async def toggle(self,i,b):
-        p=await db.fetchrow("SELECT * FROM shop.products WHERE product_id=$1",self.pid)
-        new="PAUSED" if p["status"]=="ACTIVE" else "ACTIVE"
-        await db.execute("UPDATE shop.products SET status=$2,updated_at=NOW() WHERE product_id=$1",self.pid,new)
-        await refresh_store(i.guild,p["shop_id"])
-        shop = await db.fetchrow("SELECT * FROM shop.shops WHERE shop_id=$1", p["shop_id"])
-        if shop and shop["shop_type"] == "CASINO":
-            await refresh_casino_panel(i.guild)
+        p=await db.fetchrow("SELECT * FROM shop.products WHERE product_id=$1",self.product_id); new="PAUSED" if p["status"]=="ACTIVE" else "ACTIVE"
+        await db.execute("UPDATE shop.products SET status=$2,updated_at=NOW() WHERE product_id=$1",self.product_id,new)
+        await refresh_store(i.guild,p["shop_id"]); s=await db.fetchrow("SELECT * FROM shop.shops WHERE shop_id=$1",p["shop_id"])
+        if s and s["shop_type"]=="CASINO": await refresh_casino_panel(i.guild)
         await i.response.send_message(f"商品状態: **{new}**",ephemeral=True)
-
     @discord.ui.button(label="商品削除",emoji="🗑️",style=discord.ButtonStyle.danger)
     async def delete(self,i,b):
-        p=await db.fetchrow("SELECT * FROM shop.products WHERE product_id=$1",self.pid)
-        await db.execute("UPDATE shop.products SET status='DELETED',updated_at=NOW() WHERE product_id=$1",self.pid)
-        await refresh_store(i.guild,p["shop_id"])
-        shop = await db.fetchrow("SELECT * FROM shop.shops WHERE shop_id=$1", p["shop_id"])
-        if shop and shop["shop_type"] == "CASINO":
-            await refresh_casino_panel(i.guild)
+        p=await db.fetchrow("SELECT * FROM shop.products WHERE product_id=$1",self.product_id)
+        await db.execute("UPDATE shop.products SET status='DELETED',updated_at=NOW() WHERE product_id=$1",self.product_id)
+        await refresh_store(i.guild,p["shop_id"]); s=await db.fetchrow("SELECT * FROM shop.shops WHERE shop_id=$1",p["shop_id"])
+        if s and s["shop_type"]=="CASINO": await refresh_casino_panel(i.guild)
         await i.response.send_message("🗑️ 商品を削除しました。",ephemeral=True)
+
 
 async def show_product_admin(i,shop_id):
     rows=await db.fetch("""SELECT * FROM shop.products WHERE shop_id=$1 AND status<>'DELETED'
@@ -868,8 +889,10 @@ async def refresh_store(guild,shop_id):
     if thread:
         try:
             m=await thread.fetch_message(s["panel_message_id"])
-            await m.edit(embed=store_embed(s,count["c"]),view=StoreView(shop_id))
-        except discord.NotFound:pass
+            total=await db.fetchval("SELECT COUNT(*) FROM shop.products WHERE shop_id=$1 AND status='ACTIVE'",shop_id)
+            await m.edit(embed=await store_embed(s,0),view=StoreView(shop_id,0,max(1,(total+9)//10)))
+        except discord.NotFound:
+            pass
 
 async def refresh_ticket(channel,txid):
     tx=await db.fetchrow("SELECT * FROM shop.transactions WHERE transaction_id=$1",txid)
@@ -877,6 +900,111 @@ async def refresh_ticket(channel,txid):
         if m.author.id==bot.user.id and m.embeds and (m.embeds[0].title or "").startswith("🎫 取引チケット"):
             await m.edit(embed=ticket_embed(tx),view=TicketView(txid))
             break
+
+
+JST=ZoneInfo("Asia/Tokyo")
+auction_tasks={}
+
+def auction_idle_embed():
+    return discord.Embed(title="🔨 PAL 競り市場",description="現在開催中の競りはありません。\n\n商品を競りに出品できます。")
+
+def parse_jst_datetime(v):
+    for f in ("%Y/%m/%d %H:%M","%Y-%m-%d %H:%M"):
+        try:return datetime.strptime(v.strip(),f).replace(tzinfo=JST).astimezone(timezone.utc)
+        except ValueError:pass
+    raise ValueError
+
+async def auction_embed(a):
+    sec=max(0,int((a["ends_at"]-datetime.now(timezone.utc)).total_seconds())); h,sec=divmod(sec,3600); m=sec//60
+    bidder=f"<@{a['highest_bidder_id']}>" if a["highest_bidder_id"] else "まだいません"
+    return discord.Embed(title="🔨 PAL 競り市場",description=f"📦 商品\n{a['product_name']}\n\n📝 商品説明\n{a['product_description']}\n\n👤 出品者\n<@{a['seller_id']}>\n\n💰 現在価格\n{fmt_money(a['current_price'],'PAL')}\n\n👑 最高入札者\n{bidder}\n\n⏰ 終了\n{a['ends_at'].astimezone(JST).strftime('%Y年%m月%d日 %H:%M')}\n\n⏳ 残り\n{h}時間{m}分")
+
+async def refresh_auction_panel(guild):
+    s=await db.fetchrow("SELECT * FROM shop.systems WHERE guild_id=$1",guild.id)
+    if not s or not s["auction_channel_id"]:return
+    ch=guild.get_channel(s["auction_channel_id"])
+    if not ch:return
+    a=await db.fetchrow("SELECT * FROM shop.auctions WHERE guild_id=$1 AND status='ACTIVE'",guild.id)
+    embed=await auction_embed(a) if a else auction_idle_embed(); view=AuctionActiveView(a["auction_id"]) if a else AuctionIdleView()
+    msg=None
+    if s["auction_message_id"]:
+        try:msg=await ch.fetch_message(s["auction_message_id"])
+        except discord.HTTPException:pass
+    if msg:await msg.edit(embed=embed,view=view)
+    else:
+        msg=await ch.send(embed=embed,view=view)
+        await db.execute("UPDATE shop.systems SET auction_message_id=$2,updated_at=NOW() WHERE guild_id=$1",guild.id,msg.id)
+
+class AuctionCreateModal(discord.ui.Modal,title="🔨 競りを開始"):
+    product_name=discord.ui.TextInput(label="商品名",max_length=100)
+    product_description=discord.ui.TextInput(label="商品説明",style=discord.TextStyle.paragraph,max_length=1500)
+    start_price=discord.ui.TextInput(label="開始価格 PAL",max_length=18)
+    ends_at=discord.ui.TextInput(label="終了日時 例 2026/07/15 23:00",max_length=16)
+    async def on_submit(self,i):
+        try:
+            price=int(self.start_price.value.replace(",","")); ends=parse_jst_datetime(self.ends_at.value)
+            if price<1 or ends<=datetime.now(timezone.utc):raise ValueError
+        except ValueError:return await i.response.send_message("開始価格と未来の終了日時を確認してください。",ephemeral=True)
+        if await db.fetchrow("SELECT 1 FROM shop.auctions WHERE guild_id=$1 AND status='ACTIVE'",i.guild_id):return await i.response.send_message("現在競りが開催されています。",ephemeral=True)
+        await i.response.send_message(embed=discord.Embed(title="🔨 競りを開始しますか？",description=f"📦 商品\n{self.product_name.value}\n\n📝 商品説明\n{self.product_description.value}\n\n💰 開始価格\n{fmt_money(price,'PAL')}\n\n⏰ 終了\n{ends.astimezone(JST).strftime('%Y年%m月%d日 %H:%M')}"),view=AuctionConfirmView(self.product_name.value,self.product_description.value,price,ends),ephemeral=True)
+
+class AuctionConfirmView(discord.ui.View):
+    def __init__(self,n,d,p,e):super().__init__(timeout=300);self.n=n;self.d=d;self.p=p;self.e=e
+    @discord.ui.button(label="競り開始",emoji="🔨",style=discord.ButtonStyle.success)
+    async def confirm(self,i,b):
+        try:a=await db.fetchrow("INSERT INTO shop.auctions(guild_id,seller_id,product_name,product_description,start_price,current_price,ends_at,status) VALUES($1,$2,$3,$4,$5,$5,$6,'ACTIVE') RETURNING *",i.guild_id,i.user.id,self.n,self.d,self.p,self.e)
+        except Exception:return await i.response.send_message("現在競りが開催されています。",ephemeral=True)
+        schedule_auction(i.guild,a["auction_id"],a["ends_at"]);await refresh_auction_panel(i.guild);await i.response.edit_message(content="🔨 競りを開始しました。",embed=None,view=None)
+
+class AuctionIdleView(discord.ui.View):
+    def __init__(self):super().__init__(timeout=None)
+    @discord.ui.button(label="競りを開始する",emoji="🔨",style=discord.ButtonStyle.success,custom_id="shop:auction:create")
+    async def create(self,i,b):await i.response.send_modal(AuctionCreateModal())
+
+class AuctionBidModal(discord.ui.Modal,title="💰 入札"):
+    amount=discord.ui.TextInput(label="入札額 PAL",max_length=18)
+    def __init__(self,aid):super().__init__();self.aid=int(aid)
+    async def on_submit(self,i):
+        try:amount=int(self.amount.value.replace(",",""))
+        except ValueError:return await i.response.send_message("整数PALで入力してください。",ephemeral=True)
+        async with db.acquire() as con:
+            async with con.transaction():
+                a=await con.fetchrow("SELECT * FROM shop.auctions WHERE auction_id=$1 FOR UPDATE",self.aid)
+                if not a or a["status"]!="ACTIVE" or a["ends_at"]<=datetime.now(timezone.utc):return await i.response.send_message("競りは終了しています。",ephemeral=True)
+                if a["seller_id"]==i.user.id:return await i.response.send_message("自分の競りには入札できません。",ephemeral=True)
+                if amount<=a["current_price"]:return await i.response.send_message("現在価格より1 PAL以上高く入力してください。",ephemeral=True)
+                acc=await con.fetchrow("SELECT * FROM bank.accounts WHERE account_type='USER' AND owner_id=$1 AND currency='PAL' FOR UPDATE",i.user.id)
+                if not acc or acc["balance"]<amount:return await i.response.send_message("PAL残高が不足しています。",ephemeral=True)
+                old=None
+                if a["highest_bidder_id"]:old=await con.fetchrow("SELECT * FROM bank.accounts WHERE account_type='USER' AND owner_id=$1 AND currency='PAL' FOR UPDATE",a["highest_bidder_id"])
+                await con.execute("UPDATE bank.accounts SET balance=balance-$2,updated_at=NOW() WHERE account_id=$1",acc["account_id"],amount)
+                if old:await con.execute("UPDATE bank.accounts SET balance=balance+$2,updated_at=NOW() WHERE account_id=$1",old["account_id"],a["current_price"])
+                await con.execute("UPDATE shop.auctions SET current_price=$2,highest_bidder_id=$3 WHERE auction_id=$1",self.aid,amount,i.user.id)
+                await con.execute("INSERT INTO shop.auction_bids(auction_id,bidder_id,amount) VALUES($1,$2,$3)",self.aid,i.user.id,amount)
+        await refresh_auction_panel(i.guild);await i.response.send_message(f"💰 {fmt_money(amount,'PAL')} で入札しました。",ephemeral=True)
+
+class AuctionActiveView(discord.ui.View):
+    def __init__(self,aid):super().__init__(timeout=None);self.aid=int(aid)
+    @discord.ui.button(label="入札する",emoji="💰",style=discord.ButtonStyle.success,custom_id="shop:auction:bid")
+    async def bid(self,i,b):await i.response.send_modal(AuctionBidModal(self.aid))
+
+async def finish_auction(guild,aid):
+    a=await db.fetchrow("SELECT * FROM shop.auctions WHERE auction_id=$1",aid)
+    if not a or a["status"]!="ACTIVE":return
+    if not a["highest_bidder_id"]:
+        await db.execute("UPDATE shop.auctions SET status='NO_BIDS',completed_at=NOW() WHERE auction_id=$1",aid)
+    else:
+        tx=await db.fetchrow("INSERT INTO shop.transactions(guild_id,shop_id,product_id,buyer_id,seller_id,currency,shop_name_snapshot,product_name_snapshot,product_description_snapshot,price_snapshot,status) VALUES($1,NULL,NULL,$2,$3,'PAL','PAL 競り市場',$4,$5,$6,'SELLER_ACTION_REQUIRED') RETURNING *",a["guild_id"],a["highest_bidder_id"],a["seller_id"],a["product_name"],a["product_description"],a["current_price"])
+        await db.execute("INSERT INTO shop.escrows(transaction_id,currency,amount,status) VALUES($1,'PAL',$2,'HELD')",tx["transaction_id"],a["current_price"])
+        await db.execute("UPDATE shop.auctions SET status='COMPLETED',transaction_id=$2,completed_at=NOW() WHERE auction_id=$1",aid,tx["transaction_id"])
+        ch=await create_ticket(guild,tx);await db.execute("UPDATE shop.transactions SET ticket_channel_id=$2 WHERE transaction_id=$1",tx["transaction_id"],ch.id)
+    await refresh_auction_panel(guild)
+
+def schedule_auction(guild,aid,ends):
+    async def run():
+        await asyncio.sleep(max(0,(ends-datetime.now(timezone.utc)).total_seconds()));await finish_auction(guild,aid)
+    auction_tasks[aid]=asyncio.create_task(run())
+
 
 @bot.event
 async def setup_hook():

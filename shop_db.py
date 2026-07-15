@@ -139,6 +139,36 @@ CREATE TABLE IF NOT EXISTS shop.escrows (
     released_at TIMESTAMPTZ,
     refunded_at TIMESTAMPTZ
 );
+
+ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS auction_channel_id BIGINT;
+ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS auction_message_id BIGINT;
+
+CREATE TABLE IF NOT EXISTS shop.auctions (
+    auction_id BIGSERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    seller_id BIGINT NOT NULL,
+    product_name TEXT NOT NULL,
+    product_description TEXT NOT NULL,
+    start_price BIGINT NOT NULL,
+    current_price BIGINT NOT NULL,
+    highest_bidder_id BIGINT,
+    ends_at TIMESTAMPTZ NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ACTIVE',
+    transaction_id BIGINT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_active_auction_guild
+ON shop.auctions(guild_id) WHERE status='ACTIVE';
+
+CREATE TABLE IF NOT EXISTS shop.auction_bids (
+    bid_id BIGSERIAL PRIMARY KEY,
+    auction_id BIGINT NOT NULL REFERENCES shop.auctions(auction_id) ON DELETE CASCADE,
+    bidder_id BIGINT NOT NULL,
+    amount BIGINT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 """
 
 async def init_db():
