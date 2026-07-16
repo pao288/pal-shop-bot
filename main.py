@@ -96,7 +96,12 @@ async def sales_count(shop_id):
                                 WHERE shop_id=$1 AND status='COMPLETED'""", shop_id)
 
 async def log_event(guild, text):
-    system = await db.fetchrow("SELECT log_channel_id FROM shop.systems WHERE guild_id=$1", guild.id)
+    """📜ログへの通知はあくまで補助機能。カラム未整備などで失敗しても本処理は絶対に止めない。"""
+    try:
+        system = await db.fetchrow("SELECT log_channel_id FROM shop.systems WHERE guild_id=$1", guild.id)
+    except Exception:
+        log.exception("log_event: shop.systems.log_channel_id の取得に失敗（DBマイグレーション未反映の可能性）")
+        return
     if not system or not system["log_channel_id"]:
         return
     ch = guild.get_channel(system["log_channel_id"])
@@ -256,6 +261,23 @@ async def ensure_system(guild):
     """!shopsetup 本体。既存のカテゴリ／チャンネルは再利用し、Discord側で消えた分だけ復旧する。
     DB（店舗・商品・在庫・評価・購入履歴・オークション）には一切触れない。
     公式CASINO SHOPも既存があれば必ず再利用し、重複作成しない（商品迷子バグの防止）。"""
+    # 保険: init_db側のマイグレーションが何らかの理由で反映されていない場合に備え、
+    # ここでも必要なカラムの存在を保証してから処理を続ける（何度実行しても安全）。
+    try:
+        await db.execute("""
+            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS log_channel_id BIGINT;
+            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS admin_channel_id BIGINT;
+            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS admin_message_id BIGINT;
+            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS auction_category_id BIGINT;
+            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS pal_open_message_id BIGINT;
+            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS casino_message_id BIGINT;
+            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS auction_channel_id BIGINT;
+            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS auction_message_id BIGINT;
+            ALTER TABLE shop.products ADD COLUMN IF NOT EXISTS stock INTEGER NOT NULL DEFAULT 0;
+        """)
+    except Exception:
+        log.exception("ensure_system: systemsカラムの自己修復に失敗")
+
     counts = {"created": 0, "restored": 0, "reused": 0}
     cur = await db.fetchrow("SELECT * FROM shop.systems WHERE guild_id=$1", guild.id) or {}
 
@@ -1728,6 +1750,24 @@ def schedule_auction(guild,aid,ends):
 @bot.event
 async def setup_hook():
     await db.init_db()
+    # 保険: 起動直後にもう一度、必要なカラムの存在を保証しておく（init_db側の一部ステップが
+    # 何らかの理由で反映されていなくても、ここで確実に追いつかせる）。
+    try:
+        await db.execute("""
+            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS log_channel_id BIGINT;
+            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS admin_channel_id BIGINT;
+            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS admin_message_id BIGINT;
+            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS auction_category_id BIGINT;
+            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS pal_open_message_id BIGINT;
+            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS casino_message_id BIGINT;
+            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS auction_channel_id BIGINT;
+            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS auction_message_id BIGINT;
+            ALTER TABLE shop.products ADD COLUMN IF NOT EXISTS stock INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE shop.transactions ADD COLUMN IF NOT EXISTS quantity INTEGER NOT NULL DEFAULT 1;
+        """)
+        log.info("起動時カラム自己修復チェック完了")
+    except Exception:
+        log.exception("起動時カラム自己修復に失敗")
     bot.add_view(SetupView())
     bot.add_view(OpenShopPanel())
     bot.add_view(CasinoShopView())
