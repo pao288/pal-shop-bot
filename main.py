@@ -4,6 +4,7 @@ import logging
 from zoneinfo import ZoneInfo
 from datetime import datetime, timezone, timedelta
 import discord
+import asyncpg
 from discord.ext import commands
 import shop_db as db
 
@@ -262,21 +263,11 @@ async def ensure_system(guild):
     DB（店舗・商品・在庫・評価・購入履歴・オークション）には一切触れない。
     公式CASINO SHOPも既存があれば必ず再利用し、重複作成しない（商品迷子バグの防止）。"""
     # 保険: init_db側のマイグレーションが何らかの理由で反映されていない場合に備え、
-    # ここでも必要なカラムの存在を保証してから処理を続ける（何度実行しても安全）。
+    # ここでもスキーマ全体の存在を保証してから処理を続ける（何度実行しても安全）。
     try:
-        await db.execute("""
-            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS log_channel_id BIGINT;
-            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS admin_channel_id BIGINT;
-            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS admin_message_id BIGINT;
-            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS auction_category_id BIGINT;
-            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS pal_open_message_id BIGINT;
-            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS casino_message_id BIGINT;
-            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS auction_channel_id BIGINT;
-            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS auction_message_id BIGINT;
-            ALTER TABLE shop.products ADD COLUMN IF NOT EXISTS stock INTEGER NOT NULL DEFAULT 0;
-        """)
+        await db.ensure_schema()
     except Exception:
-        log.exception("ensure_system: systemsカラムの自己修復に失敗")
+        log.exception("ensure_system: スキーマの自己修復に失敗")
 
     counts = {"created": 0, "restored": 0, "reused": 0}
     cur = await db.fetchrow("SELECT * FROM shop.systems WHERE guild_id=$1", guild.id) or {}
@@ -413,12 +404,13 @@ async def repost_panels(guild):
 
 
 async def delete_system(guild):
-    """Discord側（カテゴリ・フォーラム・チケット・ログ・パネル・店舗スレッド）のみを削除する。
-    DB（店舗・商品・在庫・評価・購入履歴・オークション）は一切削除しない。
-    削除済みチケットに紐づく進行中取引はエスクローだけ返金して安全に閉じる（データそのものは残す）。"""
+    """Discord側（カテゴリ・フォーラム・チケット・ログ・パネル・店舗スレッド）に加えて、
+    店舗・商品データ（shop.shops / shop.products、評価も連動して削除される）も削除する。
+    取引履歴（shop.transactions）・オークション記録（shop.auctions）は、店舗名・商品名の
+    スナップショットが独立して保存されているため、削除後も購入履歴として参照可能なまま保持する。"""
     system = await db.fetchrow("SELECT * FROM shop.systems WHERE guild_id=$1", guild.id)
     if not system:
-        return
+        return 0, 0
 
     # 進行中の取引（削除対象チケットに紐づくもの）はエスクローを返金してから閉じる。資金保護のため。
     async with db.POOL.acquire() as con:
@@ -436,6 +428,20 @@ async def delete_system(guild):
                 await con.execute("""UPDATE shop.transactions SET status='CANCELLED',updated_at=NOW()
                                      WHERE transaction_id=$1""", tx["transaction_id"])
 
+    # 開催中のオークションがあれば、最高入札者へ入札額を返金してキャンセルする。
+    async with db.POOL.acquire() as con:
+        async with con.transaction():
+            a = await con.fetchrow("SELECT * FROM shop.auctions WHERE guild_id=$1 AND status='ACTIVE' FOR UPDATE", guild.id)
+            if a:
+                if a["highest_bidder_id"]:
+                    acc = await account_row(con, a["highest_bidder_id"], "PAL", True)
+                    if acc:
+                        await change_balance(con, acc["account_id"], a["current_price"])
+                await con.execute("UPDATE shop.auctions SET status='CANCELLED',completed_at=NOW() WHERE auction_id=$1", a["auction_id"])
+                old_task = auction_tasks.pop(a["auction_id"], None)
+                if old_task and not old_task.done():
+                    old_task.cancel()
+
     ids = [
         system["pal_open_channel_id"], system["pal_announce_channel_id"],
         system["pal_forum_channel_id"], system["casino_channel_id"],
@@ -444,25 +450,28 @@ async def delete_system(guild):
         system["admin_channel_id"], system["auction_channel_id"],
         system["pal_category_id"], system["casino_category_id"], system["auction_category_id"],
     ]
-    deleted = 0
+    deleted_channels = 0
     for cid in ids:
         if cid:
             ch = guild.get_channel(cid)
             if ch:
                 try:
-                    await ch.delete(reason="PAL SHOP SYSTEM Discord側削除（DBは保持）")
-                    deleted += 1
+                    await ch.delete(reason="PAL SHOP SYSTEM 削除")
+                    deleted_channels += 1
                 except discord.HTTPException:
                     pass
 
-    # 店舗の店舗スレッド参照・パネルメッセージIDもクリアしておく（DBの店舗・商品行自体は保持）。
-    await db.execute("""UPDATE shop.shops SET forum_thread_id=NULL,panel_message_id=NULL,updated_at=NOW()
-                        WHERE guild_id=$1""", guild.id)
-    await db.execute("""UPDATE shop.systems SET status='INACTIVE',
+    # 店舗・商品データを削除する（shop.products / shop.ratings は shop.shops への
+    # ON DELETE CASCADE でまとめて削除される）。取引履歴自体は保持する。
+    deleted_shops = await db.fetchval(
+        "WITH d AS (DELETE FROM shop.shops WHERE guild_id=$1 RETURNING 1) SELECT COUNT(*) FROM d", guild.id
+    )
+
+    await db.execute("""UPDATE shop.systems SET status='INACTIVE', casino_shop_id=NULL,
                         pal_open_message_id=NULL,casino_message_id=NULL,
                         admin_message_id=NULL,auction_message_id=NULL,updated_at=NOW()
                         WHERE guild_id=$1""", guild.id)
-    return deleted
+    return deleted_channels, deleted_shops
 
 class SetupView(discord.ui.View):
     def __init__(self):
@@ -495,6 +504,8 @@ class SetupView(discord.ui.View):
         system = await db.fetchrow("SELECT * FROM shop.systems WHERE guild_id=$1 AND status='ACTIVE'", i.guild_id)
         if not system:
             return await i.response.send_message("先にSHOP SYSTEMを作成してください。", ephemeral=True)
+        if not system["casino_shop_id"]:
+            return await i.response.send_message("CASINO SHOP本体が未設定です。「SHOP SYSTEMを作成」または「システム復旧」を先に実行してください。", ephemeral=True)
         shop = await db.fetchrow("SELECT * FROM shop.shops WHERE shop_id=$1", system["casino_shop_id"])
         count = await db.fetchrow("""SELECT COUNT(*) c FROM shop.products
                                      WHERE shop_id=$1 AND status<>'DELETED'""", system["casino_shop_id"])
@@ -532,7 +543,8 @@ class SetupView(discord.ui.View):
     async def delete(self, i, b):
         await i.response.send_message(
             "⚠️ カテゴリ・フォーラム・チケット・ログ・パネル・店舗スレッドをDiscord側から削除します。\n"
-            "店舗・商品・在庫・評価・購入履歴・オークションのデータは削除されません。",
+            "**店舗・商品データ（店舗名・商品名・在庫・評価）も削除されます。この操作は取り消せません。**\n"
+            "購入履歴（取引記録）・オークション記録は、店舗名・商品名を含めてそのまま保持されます。",
             view=DeleteConfirmView(), ephemeral=True
         )
 
@@ -540,14 +552,15 @@ class DeleteConfirmView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=120)
 
-    @discord.ui.button(label="Discord側を削除する", emoji="🗑️", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="削除する（店舗・商品データも含む）", emoji="🗑️", style=discord.ButtonStyle.danger)
     async def confirm(self, i, b):
         await i.response.defer(ephemeral=True)
         try:
-            deleted = await delete_system(i.guild)
+            deleted_channels, deleted_shops = await delete_system(i.guild)
             await i.followup.send(
-                f"🗑️ Discord側のカテゴリ・チャンネルを削除しました。（{deleted}件）\n"
-                "店舗・商品・在庫・評価・購入履歴・オークションのデータは保持されています。",
+                f"🗑️ Discord側のカテゴリ・チャンネルを削除しました。（{deleted_channels}件）\n"
+                f"🏪 店舗データも削除しました。（{deleted_shops}件、商品・評価も連動して削除済み）\n\n"
+                "購入履歴・オークション記録は保持されています。",
                 ephemeral=True
             )
         except Exception as e:
@@ -701,10 +714,14 @@ class OpenShopModal(discord.ui.Modal, title="🏪 お店を開く"):
         system = await db.fetchrow("SELECT * FROM shop.systems WHERE guild_id=$1 AND status='ACTIVE'", i.guild_id)
         if not system:
             return await i.followup.send("SHOP SYSTEMが未設置です。", ephemeral=True)
-        shop = await db.fetchrow("""INSERT INTO shop.shops(
-            guild_id,shop_type,owner_id,owner_type,is_official,name,description,status)
-            VALUES($1,'PAL',$2,'USER',FALSE,$3,$4,'ACTIVE') RETURNING *""",
-            i.guild_id,i.user.id,self.shop_name.value,self.shop_description.value)
+        try:
+            shop = await db.fetchrow("""INSERT INTO shop.shops(
+                guild_id,shop_type,owner_id,owner_type,is_official,name,description,status)
+                VALUES($1,'PAL',$2,'USER',FALSE,$3,$4,'ACTIVE') RETURNING *""",
+                i.guild_id,i.user.id,self.shop_name.value,self.shop_description.value)
+        except asyncpg.UniqueViolationError:
+            # 連打・同時押しでレースになった場合の保険。DB側のユニーク制約で二重作成を防ぐ。
+            return await i.followup.send("すでにPAL店舗を持っています。", ephemeral=True)
         await db.execute("""INSERT INTO shop.products(shop_id,name,description,price,currency,stock)
                             VALUES($1,$2,$3,$4,'PAL',$5)""",
                          shop["shop_id"],self.product_name.value,self.product_description.value,price,DEFAULT_INITIAL_STOCK)
@@ -1188,9 +1205,19 @@ class PurchaseConfirmView(discord.ui.View):
         self.product_id = int(product_id)
         self.confirmed_price = int(confirmed_price)
         self.quantity = int(quantity)
+        self._processing = False  # 連打による二重購入を防ぐガード
 
     @discord.ui.button(label="この商品を購入する",emoji="✅",style=discord.ButtonStyle.success)
     async def confirm(self,i,b):
+        if self._processing:
+            return await i.response.send_message("処理中です。少しお待ちください。",ephemeral=True)
+        self._processing = True
+        try:
+            await self._do_confirm(i,b)
+        finally:
+            self._processing = False
+
+    async def _do_confirm(self,i,b):
         await i.response.defer(ephemeral=True)
         qty=self.quantity
         try:
@@ -1750,24 +1777,13 @@ def schedule_auction(guild,aid,ends):
 @bot.event
 async def setup_hook():
     await db.init_db()
-    # 保険: 起動直後にもう一度、必要なカラムの存在を保証しておく（init_db側の一部ステップが
+    # 保険: 起動直後にもう一度スキーマ全体を保証しておく（init_db側の一部ステップが
     # 何らかの理由で反映されていなくても、ここで確実に追いつかせる）。
     try:
-        await db.execute("""
-            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS log_channel_id BIGINT;
-            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS admin_channel_id BIGINT;
-            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS admin_message_id BIGINT;
-            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS auction_category_id BIGINT;
-            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS pal_open_message_id BIGINT;
-            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS casino_message_id BIGINT;
-            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS auction_channel_id BIGINT;
-            ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS auction_message_id BIGINT;
-            ALTER TABLE shop.products ADD COLUMN IF NOT EXISTS stock INTEGER NOT NULL DEFAULT 0;
-            ALTER TABLE shop.transactions ADD COLUMN IF NOT EXISTS quantity INTEGER NOT NULL DEFAULT 1;
-        """)
-        log.info("起動時カラム自己修復チェック完了")
+        await db.ensure_schema()
+        log.info("起動時スキーマ自己修復チェック完了")
     except Exception:
-        log.exception("起動時カラム自己修復に失敗")
+        log.exception("起動時スキーマ自己修復に失敗")
     bot.add_view(SetupView())
     bot.add_view(OpenShopPanel())
     bot.add_view(CasinoShopView())
