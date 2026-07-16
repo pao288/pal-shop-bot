@@ -50,7 +50,12 @@ async def _ensure_text_channel(guild, category, name, current_id, counts, overwr
     if found:
         counts["restored" if had_id else "reused"] += 1
         return found
-    new_ch = await guild.create_text_channel(name, category=category, overwrites=overwrites)
+    # discord.pyはoverwrites=Noneを渡すと「overwrites parameter expects a dict.」でエラーになるため、
+    # 未指定の場合は引数自体を渡さない。
+    kwargs = {"category": category}
+    if overwrites is not None:
+        kwargs["overwrites"] = overwrites
+    new_ch = await guild.create_text_channel(name, **kwargs)
     counts["restored" if had_id else "created"] += 1
     return new_ch
 
