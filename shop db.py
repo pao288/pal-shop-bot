@@ -1,9 +1,15 @@
 import os
+import logging
 import asyncpg
 
 POOL = None
+log = logging.getLogger("pal_shop_db")
 
-SCHEMA = """
+# スキーマは「独立して実行できるまとまり」ごとに分割しておく。
+# 1つのブロックが失敗しても（例: 既存データの都合でDOブロックがエラーになる等）、
+# 他のブロック（特に新しいカラム追加）が確実に反映されるようにするため。
+SCHEMA_STEPS = [
+("base_tables", """
 CREATE SCHEMA IF NOT EXISTS shop;
 
 CREATE TABLE IF NOT EXISTS shop.systems (
@@ -38,7 +44,9 @@ CREATE TABLE IF NOT EXISTS shop.shops (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+"""),
 
+("shops_columns", """
 ALTER TABLE shop.shops ADD COLUMN IF NOT EXISTS shop_type TEXT;
 ALTER TABLE shop.shops ADD COLUMN IF NOT EXISTS owner_type TEXT;
 ALTER TABLE shop.shops ADD COLUMN IF NOT EXISTS is_official BOOLEAN;
@@ -60,7 +68,9 @@ DROP INDEX IF EXISTS shop.uq_shop_user_owner;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_shop_user_owner_type
 ON shop.shops(guild_id, owner_id, shop_type)
 WHERE owner_type='USER' AND status <> 'DELETED';
+"""),
 
+("products_table", """
 CREATE TABLE IF NOT EXISTS shop.products (
     product_id BIGSERIAL PRIMARY KEY,
     shop_id BIGINT NOT NULL REFERENCES shop.shops(shop_id) ON DELETE CASCADE,
@@ -91,7 +101,9 @@ CREATE TABLE IF NOT EXISTS shop.transactions (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+"""),
 
+("products_columns", """
 ALTER TABLE shop.products ADD COLUMN IF NOT EXISTS currency TEXT;
 ALTER TABLE shop.products ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
 ALTER TABLE shop.products ADD COLUMN IF NOT EXISTS stock INTEGER;
@@ -102,10 +114,13 @@ ALTER TABLE shop.products ALTER COLUMN currency SET DEFAULT 'PAL';
 ALTER TABLE shop.products ALTER COLUMN updated_at SET DEFAULT NOW();
 ALTER TABLE shop.products ALTER COLUMN stock SET DEFAULT 0;
 ALTER TABLE shop.products ALTER COLUMN stock SET NOT NULL;
+"""),
 
--- 過去バグ対策マイグレーション: !shopsetup再実行等で重複してしまった公式CASINO SHOPを1つに統合する。
--- 統合先は shop.systems.casino_shop_id が指しているもの（無ければ一番古いもの）。
--- 統合される側の商品は統合先へ付け替えてから DELETED にするため、迷子になっていた商品もここで復旧する。
+# 過去バグ対策マイグレーション: !shopsetup再実行等で重複してしまった公式CASINO SHOPを1つに統合する。
+# 統合先は shop.systems.casino_shop_id が指しているもの（無ければ一番古いもの）。
+# 統合される側の商品は統合先へ付け替えてから DELETED にするため、迷子になっていた商品もここで復旧する。
+# ここが万一失敗しても、他のステップ（カラム追加等）には影響しない。
+("casino_shop_dedup_migration", """
 DO $$
 DECLARE
     g RECORD;
@@ -138,12 +153,16 @@ BEGIN
         UPDATE shop.systems SET casino_shop_id=keep_id, updated_at=NOW() WHERE guild_id=g.guild_id;
     END LOOP;
 END $$;
+"""),
 
--- 公式CASINO SHOPはギルドごとに1つだけに制限する（!shopsetup再実行時の商品迷子バグの再発防止）。
+# 公式CASINO SHOPはギルドごとに1つだけに制限する（!shopsetup再実行時の商品迷子バグの再発防止）。
+("casino_shop_unique_index", """
 CREATE UNIQUE INDEX IF NOT EXISTS uq_casino_shop_guild
 ON shop.shops(guild_id) WHERE shop_type='CASINO' AND is_official=TRUE AND status<>'DELETED';
+"""),
 
--- 店舗評価（購入者が取引完了後に1～5で評価）。
+# 店舗評価（購入者が取引完了後に1～5で評価）。
+("ratings_table", """
 CREATE TABLE IF NOT EXISTS shop.ratings (
     rating_id BIGSERIAL PRIMARY KEY,
     shop_id BIGINT NOT NULL REFERENCES shop.shops(shop_id) ON DELETE CASCADE,
@@ -152,15 +171,21 @@ CREATE TABLE IF NOT EXISTS shop.ratings (
     score SMALLINT NOT NULL CHECK(score BETWEEN 1 AND 5),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+"""),
 
--- ログ／管理／オークションカテゴリ用の永続チャンネルID。
+# ログ／管理／オークションカテゴリ用の永続チャンネルID。
+("systems_new_columns", """
 ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS log_channel_id BIGINT;
 ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS admin_channel_id BIGINT;
 ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS admin_message_id BIGINT;
 ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS auction_category_id BIGINT;
 ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS pal_open_message_id BIGINT;
 ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS casino_message_id BIGINT;
+ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS auction_channel_id BIGINT;
+ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS auction_message_id BIGINT;
+"""),
 
+("products_fk_fix", """
 DO $$
 BEGIN
     IF EXISTS (
@@ -176,7 +201,9 @@ END $$;
 ALTER TABLE shop.products
 ADD CONSTRAINT products_shop_id_fkey
 FOREIGN KEY (shop_id) REFERENCES shop.shops(shop_id) ON DELETE CASCADE;
+"""),
 
+("transactions_columns", """
 ALTER TABLE shop.transactions ADD COLUMN IF NOT EXISTS currency TEXT;
 ALTER TABLE shop.transactions ADD COLUMN IF NOT EXISTS previous_status TEXT;
 ALTER TABLE shop.transactions ADD COLUMN IF NOT EXISTS ticket_channel_id BIGINT;
@@ -194,7 +221,9 @@ UPDATE shop.transactions SET quantity=1 WHERE quantity IS NULL;
 ALTER TABLE shop.transactions ALTER COLUMN currency SET DEFAULT 'PAL';
 ALTER TABLE shop.transactions ALTER COLUMN updated_at SET DEFAULT NOW();
 ALTER TABLE shop.transactions ALTER COLUMN quantity SET DEFAULT 1;
+"""),
 
+("escrows_table", """
 CREATE TABLE IF NOT EXISTS shop.escrows (
     transaction_id BIGINT PRIMARY KEY,
     buyer_id BIGINT NOT NULL,
@@ -206,10 +235,9 @@ CREATE TABLE IF NOT EXISTS shop.escrows (
     released_at TIMESTAMPTZ,
     refunded_at TIMESTAMPTZ
 );
+"""),
 
-ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS auction_channel_id BIGINT;
-ALTER TABLE shop.systems ADD COLUMN IF NOT EXISTS auction_message_id BIGINT;
-
+("auctions_tables", """
 CREATE TABLE IF NOT EXISTS shop.auctions (
     auction_id BIGSERIAL PRIMARY KEY,
     guild_id BIGINT NOT NULL,
@@ -235,14 +263,19 @@ CREATE TABLE IF NOT EXISTS shop.auction_bids (
     amount BIGINT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-
-"""
+"""),
+]
 
 async def init_db():
     global POOL
     POOL = await asyncpg.create_pool(os.environ["DATABASE_URL"])
     async with POOL.acquire() as con:
-        await con.execute(SCHEMA)
+        for step_name, stmt in SCHEMA_STEPS:
+            try:
+                await con.execute(stmt)
+            except Exception:
+                # 1ステップが失敗しても他のステップ（特に新カラム追加）は必ず実行する。
+                log.exception("shop_db schema migration step failed: %s", step_name)
 
 async def fetchrow(q, *args):
     async with POOL.acquire() as con:
